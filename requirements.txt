@@ -1,0 +1,5 @@
+python-telegram-bot==22.8
+aiohttp>=3.9,<4.0
+# Original Vidgoo extractor versions from the supplied successful Render build.
+yt-dlp[default,curl-cffi]==2026.9.27.232945.dev0
+curl-cffi==0.16.4b1
