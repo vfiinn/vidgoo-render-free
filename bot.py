@@ -26,7 +26,7 @@ from aiohttp import web
 from PIL import Image, ImageOps, UnidentifiedImageError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ChatAction
-from telegram.error import Conflict
+from telegram.error import BadRequest, Conflict
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
 )
@@ -43,7 +43,8 @@ logger = logging.getLogger(__name__)
 WEBHOOK_PATH = "/telegram/webhook"
 MEDIA_MODES = {"video": "الفيديو", "audio": "الصوت", "photos": "الصور"}
 MAX_PHOTOS = 20
-PHOTO_TIMEOUT_SECONDS = 300
+PHOTO_TIMEOUT_SECONDS = 60
+PHOTO_HTTP_TIMEOUT_SECONDS = 12
 PHOTO_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "avif", "gif")
 CHOICE_TTL_SECONDS = 15 * 60
 UPLOAD_TIMEOUTS = dict(write_timeout=180, read_timeout=180, connect_timeout=30)
@@ -143,6 +144,11 @@ def download_error_message(error: Exception) -> str:
     message = str(error).lower()
     if "suspended" in message:
         return "المنصة أبلغت أن الحساب أو المحتوى موقوف. جرّب رابطًا آخر."
+    if "empty media response" in message:
+        return (
+            "إنستغرام لم يُرجع بيانات هذا المنشور. قد يكون غير متاح دون تسجيل دخول "
+            "أو حُجب الطلب. جرّب رابطًا عامًا آخر؛ البوت يعمل بدون كوكيز حساب."
+        )
     if any(x in message for x in ("sign in", "login required", "log in",
                                   "login_required", "requiring login",
                                   "private", "not authorized", "authrequired",
@@ -207,7 +213,11 @@ def photo_post_url(url: str) -> str:
     parsed = urlsplit(url)
     host, path = (parsed.hostname or "").lower(), parsed.path
     if host in ("instagram.com", "www.instagram.com"):
-        match = re.fullmatch(r"/(p|reel|tv)/([A-Za-z0-9_-]+)/?", path)
+        if re.fullmatch(r"/(?:reels?|tv)/[A-Za-z0-9_-]+/?", path):
+            raise DownloadFailure(
+                "هذا رابط ريل/فيديو، وليس منشور صور. اختر 🎬 فيديو أو 🎵 صوت MP3."
+            )
+        match = re.fullmatch(r"/(p)/([A-Za-z0-9_-]+)/?", path)
         if match:
             return f"https://www.instagram.com/{match[1]}/{match[2]}/"
     elif host in ("x.com", "www.x.com", "mobile.x.com", "twitter.com",
@@ -231,11 +241,13 @@ def build_gallery_command(url: str, out_dir: Path) -> list[str]:
         sys.executable, "-m", "gallery_dl", "--config-ignore", "--no-input",
         "--no-colors", "--no-postprocessors", "--warning", "--cache-file", ":memory:",
         "--directory", str(out_dir.resolve()), "--filename", "{num:03}.{extension}",
-        "--range", f"1-{MAX_PHOTOS}", "--post-range", "1", "--retries", "2",
-        "--http-timeout", "30", "--filesize-max", "49M",
+        # Never sleep for minutes retrying blocked requests while holding the media queue.
+        "--range", f"1-{MAX_PHOTOS}", "--post-range", "1", "--retries", "0",
+        "--http-timeout", str(PHOTO_HTTP_TIMEOUT_SECONDS), "--filesize-max", "49M",
         "--filter", f"extension.lower() in {PHOTO_EXTENSIONS!r}",
         "--whitelist", "instagram:post,twitter:tweet,tiktok:post",
         "-o", "extractor.cookies=null", "-o", "extractor.cookies-update=false",
+        "-o", "extractor.sleep-429=0", "-o", "downloader.http.sleep-429=0",
         "-o", "extractor.netrc=false", "-o", "extractor.videos=false",
         "-o", "extractor.audio=false", "-o", "extractor.previews=false",
         "-o", "extractor.instagram.static-videos=false",
@@ -253,7 +265,9 @@ def download_photos(url: str, out_dir: Path) -> list[Path]:
             env={key: value for key, value in os.environ.items() if key != "BOT_TOKEN"},
         )
     except subprocess.TimeoutExpired as exc:
-        raise DownloadFailure("انتهت مهلة تنزيل الصور. حاول لاحقًا.") from exc
+        raise DownloadFailure(
+            "تجاوز تنزيل الصور مهلة دقيقة، فتم إيقافه حتى لا تتعطل الطلبات التالية. حاول لاحقًا."
+        ) from exc
     except OSError as exc:
         raise DownloadFailure("تعذّر تشغيل أداة تحميل الصور على الخادم.") from exc
     if result.returncode:
@@ -480,6 +494,9 @@ async def edit_status(status, text):
     if status:
         try:
             await status.edit_text(text)
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.warning("Could not update status message", exc_info=True)
         except Exception:
             logger.warning("Could not update status message", exc_info=True)
 
@@ -590,6 +607,13 @@ async def process_media(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
     message = update.effective_message
     if not message or mode not in MEDIA_MODES:
         return
+    if mode == "photos":
+        # Reject reel/profile requests BEFORE queue admission, even if another job is busy.
+        try:
+            url = photo_post_url(url)
+        except DownloadFailure as exc:
+            await message.reply_text(f"❌ {exc}")
+            return
     state = context.bot_data
     # One expensive media worker on the Free instance, with at most three waiting requests.
     if state.get("media_jobs", 0) >= 4:
