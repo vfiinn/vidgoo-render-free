@@ -1,4 +1,4 @@
-"""Download public videos from Twitter/X, Instagram and TikTok."""
+"""Download public videos, MP3 audio and post photos from X, Instagram and TikTok."""
 import asyncio
 import hashlib
 import hmac
@@ -7,10 +7,14 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
+import time
+import warnings
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.metadata import version
@@ -19,10 +23,13 @@ from urllib.parse import urlsplit
 
 import yt_dlp
 from aiohttp import web
-from telegram import Update
+from PIL import Image, ImageOps, UnidentifiedImageError
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ChatAction
 from telegram.error import Conflict
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
+)
 
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "downloads"))
@@ -34,6 +41,12 @@ SUPPORTED_DOMAINS = ("twitter.com", "x.com", "instagram.com", "tiktok.com")
 GENERIC_URL_PATTERN = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 logger = logging.getLogger(__name__)
 WEBHOOK_PATH = "/telegram/webhook"
+MEDIA_MODES = {"video": "الفيديو", "audio": "الصوت", "photos": "الصور"}
+MAX_PHOTOS = 20
+PHOTO_TIMEOUT_SECONDS = 300
+PHOTO_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "avif", "gif")
+CHOICE_TTL_SECONDS = 15 * 60
+UPLOAD_TIMEOUTS = dict(write_timeout=180, read_timeout=180, connect_timeout=30)
 
 
 class SafeFormatter(logging.Formatter):
@@ -85,8 +98,8 @@ class YTDLPLogger:
         logger.error(message)
 
 
-def build_ydl_options(out_dir: Path, url: str = "") -> dict:
-    return {
+def build_ydl_options(out_dir: Path, url: str = "", mode: str = "video") -> dict:
+    options = {
         "format": "bv*+ba/b",
         "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
         "noplaylist": True,
@@ -111,6 +124,15 @@ def build_ydl_options(out_dir: Path, url: str = "") -> dict:
         "quiet": True,
         "no_warnings": False,
     }
+    if mode == "audio":
+        options["format"] = "bestaudio/best"
+        options.pop("merge_output_format", None)
+        options["postprocessors"] = [{
+            "key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192",
+        }]
+    elif mode != "video":
+        raise ValueError("Unsupported yt-dlp mode")
+    return options
 
 
 class DownloadFailure(RuntimeError):
@@ -123,54 +145,165 @@ def download_error_message(error: Exception) -> str:
         return "المنصة أبلغت أن الحساب أو المحتوى موقوف. جرّب رابطًا آخر."
     if any(x in message for x in ("sign in", "login required", "log in",
                                   "login_required", "requiring login",
-                                  "private", "not authorized")):
+                                  "private", "not authorized", "authrequired",
+                                  "authentication required", "authenticated cookies")):
         return "هذا الطلب يتطلب تسجيل دخول أو صلاحية وصول. البوت يعمل بدون كوكيز حساب."
     if any(x in message for x in ("429", "too many requests", "rate limit")):
         return "المنصة حدّت عدد الطلبات مؤقتًا. انتظر قليلًا قبل المحاولة مجددًا."
     if any(x in message for x in ("unexpected response from webpage",
                                   "challenge", "captcha", "403", "forbidden")):
-        return "تعذّر قراءة رد المنصة؛ قد تكون حجبت الطلب أو غيّرت صفحة الفيديو. جرّب لاحقًا."
+        return "تعذّر قراءة رد المنصة؛ قد تكون حجبت الطلب أو غيّرت صفحة المنشور. جرّب لاحقًا."
     if any(x in message for x in ("timed out", "timeout", "connection",
                                   "unable to download webpage")):
         return "تعذّر الاتصال بالمنصة. حاول مجددًا لاحقًا."
     if any(x in message for x in ("not found", "404", "deleted", "unavailable",
                                   "no video", "no formats")):
-        return "الفيديو غير متاح للتنزيل أو الرابط لا يحتوي فيديو مدعومًا."
-    return "فشل تنزيل الفيديو. تأكد من رابط المنشور العام أو جرّب رابطًا آخر."
+        return "المحتوى غير متاح للتنزيل أو لا يحتوي الوسائط المطلوبة."
+    return "فشل تنزيل المحتوى. تأكد من رابط المنشور العام أو جرّب رابطًا آخر."
 
 
-def find_downloaded_file(info: dict, out_dir: Path, prepared_filename: str) -> Path:
+def find_downloaded_file(info: dict, out_dir: Path, prepared_filename: str,
+                         mode: str = "video") -> Path:
     root = out_dir.resolve()
     prepared = Path(prepared_filename)
-    candidates = [prepared.with_suffix(".mp4"), prepared]
+    extension = ".mp3" if mode == "audio" else ".mp4"
+    candidates = [prepared.with_suffix(extension), prepared]
     for item in info.get("requested_downloads") or []:
         if item.get("filepath"):
             candidates.append(Path(item["filepath"]))
-    candidates.extend(out_dir.glob("*.mp4"))
+    candidates.extend(out_dir.glob("*" + extension))
+    allowed = (".mp3",) if mode == "audio" else (".mp4", ".mkv", ".webm", ".mov")
     for candidate in candidates:
         candidate = candidate.resolve()
         if (candidate.parent == root and candidate.is_file()
-                and candidate.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov")
+                and candidate.suffix.lower() in allowed
                 and not re.search(r"\.f[^.]+\.", candidate.name)):
             return candidate
-    raise DownloadFailure("لم ينتج التنزيل ملف فيديو مكتملًا.")
+    raise DownloadFailure("لم ينتج التنزيل ملف صوت مكتملًا." if mode == "audio"
+                          else "لم ينتج التنزيل ملف فيديو مكتملًا.")
 
 
-def download_media(url: str, out_dir: Path) -> tuple[Path, str | None]:
+def download_media(url: str, out_dir: Path, mode: str = "video") -> tuple[Path, str | None]:
     if extract_supported_url(url) != url:
         raise DownloadFailure("الروابط المدعومة: تويتر/X وإنستغرام وتيك توك فقط.")
     try:
-        with yt_dlp.YoutubeDL(build_ydl_options(out_dir, url)) as ydl:
+        with yt_dlp.YoutubeDL(build_ydl_options(out_dir, url, mode)) as ydl:
             info = ydl.extract_info(url, download=True)
             # A post with multiple videos may still return a playlist object.
             while info and info.get("_type") in ("playlist", "multi_video"):
                 info = next((entry for entry in info.get("entries") or [] if entry), None)
             if not info:
-                raise DownloadFailure("الرابط لم يُرجع فيديو قابلًا للتنزيل.")
-            return find_downloaded_file(info, out_dir, ydl.prepare_filename(info)), info.get("id")
+                raise DownloadFailure("الرابط لم يُرجع وسائط قابلة للتنزيل.")
+            return find_downloaded_file(info, out_dir, ydl.prepare_filename(info), mode), info.get("id")
     except yt_dlp.utils.DownloadError as exc:
         logger.warning("Download failed: %s", exc)
         raise DownloadFailure(download_error_message(exc)) from exc
+
+
+def photo_post_url(url: str) -> str:
+    """Accept single posts only, never crawl an entire profile or search page."""
+    if extract_supported_url(url) != url:
+        raise DownloadFailure("الروابط المدعومة: تويتر/X وإنستغرام وتيك توك فقط.")
+    parsed = urlsplit(url)
+    host, path = (parsed.hostname or "").lower(), parsed.path
+    if host in ("instagram.com", "www.instagram.com"):
+        match = re.fullmatch(r"/(p|reel|tv)/([A-Za-z0-9_-]+)/?", path)
+        if match:
+            return f"https://www.instagram.com/{match[1]}/{match[2]}/"
+    elif host in ("x.com", "www.x.com", "mobile.x.com", "twitter.com",
+                  "www.twitter.com", "mobile.twitter.com"):
+        match = re.fullmatch(r"/([A-Za-z0-9_]+|i/web)/status/(\d+)(?:/(?:photo|video)/\d+)?/?", path)
+        if match:
+            return f"https://x.com/{match[1]}/status/{match[2]}"
+    elif host in ("tiktok.com", "www.tiktok.com", "m.tiktok.com"):
+        if re.fullmatch(r"/(?:@[\w.-]+|share)/(?:photo|video)/\d+/?", path):
+            return f"https://www.tiktok.com{path}"
+        if re.fullmatch(r"/t/[A-Za-z0-9]+/?", path):
+            return f"https://www.tiktok.com{path}"
+    elif host in ("vm.tiktok.com", "vt.tiktok.com"):
+        if re.fullmatch(r"/[A-Za-z0-9]+/?", path):
+            return f"https://{host}{path}"
+    raise DownloadFailure("لتحميل الصور أرسل رابط المنشور نفسه، وليس رابط الحساب أو البحث.")
+
+
+def build_gallery_command(url: str, out_dir: Path) -> list[str]:
+    return [
+        sys.executable, "-m", "gallery_dl", "--config-ignore", "--no-input",
+        "--no-colors", "--no-postprocessors", "--warning", "--cache-file", ":memory:",
+        "--directory", str(out_dir.resolve()), "--filename", "{num:03}.{extension}",
+        "--range", f"1-{MAX_PHOTOS}", "--post-range", "1", "--retries", "2",
+        "--http-timeout", "30", "--filesize-max", "49M",
+        "--filter", f"extension.lower() in {PHOTO_EXTENSIONS!r}",
+        "--whitelist", "instagram:post,twitter:tweet,tiktok:post",
+        "-o", "extractor.cookies=null", "-o", "extractor.cookies-update=false",
+        "-o", "extractor.netrc=false", "-o", "extractor.videos=false",
+        "-o", "extractor.audio=false", "-o", "extractor.previews=false",
+        "-o", "extractor.instagram.static-videos=false",
+        "-o", "extractor.twitter.conversations=false", "-o", "extractor.twitter.quoted=false",
+        "-o", "extractor.tiktok.covers=false", url,
+    ]
+
+
+def download_photos(url: str, out_dir: Path) -> list[Path]:
+    command = build_gallery_command(photo_post_url(url), out_dir)
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=PHOTO_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
+            env={key: value for key, value in os.environ.items() if key != "BOT_TOKEN"},
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise DownloadFailure("انتهت مهلة تنزيل الصور. حاول لاحقًا.") from exc
+    except OSError as exc:
+        raise DownloadFailure("تعذّر تشغيل أداة تحميل الصور على الخادم.") from exc
+    if result.returncode:
+        logger.warning("Photo download failed: %s", result.stderr[-2000:])
+        raise DownloadFailure(download_error_message(Exception(result.stderr)))
+    photos = []
+    for path in sorted(out_dir.iterdir()):
+        if path.suffix.lower().lstrip(".") not in PHOTO_EXTENSIONS:
+            continue
+        if (path.is_symlink() or path.resolve().parent != out_dir.resolve()
+                or not path.is_file() or not 0 < path.stat().st_size < MAX_FILE_SIZE_BYTES):
+            raise DownloadFailure("لم ينتج التنزيل صورًا مكتملة بحجم مناسب.")
+        photos.append(path)
+    if not photos:
+        raise DownloadFailure("لا توجد صور قابلة للتنزيل في هذا المنشور، أو أنها غير متاحة أو كبيرة جدًا.")
+    if len(photos) > MAX_PHOTOS:
+        raise DownloadFailure("تجاوز التنزيل الحد المسموح للصور.")
+    return photos
+
+
+def prepare_photo(source: Path) -> tuple[Path, bool]:
+    """Normalize a preview for sendPhoto; preserve panoramas/large images as documents."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(source) as image:
+                width, height = image.size
+                if width * height > 25_000_000 or max(width, height) > 20 * min(width, height):
+                    image.verify()
+                    return source, True
+                image.draft("RGB", (3000, 3000))
+                image = ImageOps.exif_transpose(image)
+                image.thumbnail((3000, 3000))
+                rgb = Image.new("RGB", image.size, "white")
+                if "A" in image.getbands():
+                    rgba = image.convert("RGBA")
+                    rgb.paste(rgba, mask=rgba.getchannel("A"))
+                else:
+                    rgb.paste(image.convert("RGB"))
+                output_dir = source.parent / "prepared"
+                output_dir.mkdir(exist_ok=True)
+                output = output_dir / (source.stem + ".jpg")
+                for quality in (90, 75, 60):
+                    rgb.save(output, "JPEG", quality=quality)
+                    if 0 < output.stat().st_size < 9_500_000:
+                        return output, False
+                return source, True
+    except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError,
+            Image.DecompressionBombWarning) as exc:
+        raise DownloadFailure("تعذّر قراءة إحدى الصور؛ لم يتم إرسال ملف غير صالح.") from exc
 
 
 class CompressionError(RuntimeError):
@@ -192,13 +325,13 @@ def run_media_command(command: list[str], timeout: int):
             encoding="utf-8", errors="replace", timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        raise CompressionError("انتهت مهلة ضغط الفيديو. جرّب فيديو أقصر.") from exc
+        raise CompressionError("انتهت مهلة معالجة الملف. جرّب مقطعًا أقصر.") from exc
     except (OSError, subprocess.CalledProcessError) as exc:
         logger.warning("Media command failed: %s", exc)
-        raise CompressionError("تعذّر معالجة الفيديو بواسطة FFmpeg.") from exc
+        raise CompressionError("تعذّر معالجة الملف بواسطة FFmpeg.") from exc
 
 
-def probe_media(path: Path) -> tuple[float, bool]:
+def probe_media(path: Path, *, audio_only: bool = False) -> tuple[float, bool]:
     result = run_media_command([
         "ffprobe", "-v", "error", "-show_entries",
         "format=duration:stream=codec_type", "-of", "json", str(path),
@@ -209,11 +342,12 @@ def probe_media(path: Path) -> tuple[float, bool]:
         streams = data["streams"]
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError("Invalid duration")
-        if not any(s["codec_type"] == "video" for s in streams):
-            raise ValueError("Missing video stream")
+        required = "audio" if audio_only else "video"
+        if not any(s["codec_type"] == required for s in streams):
+            raise ValueError("Missing required stream")
         return duration, any(s["codec_type"] == "audio" for s in streams)
     except (ValueError, KeyError, TypeError) as exc:
-        raise CompressionError("تعذّر قراءة مدة الفيديو أو مسار الصورة.") from exc
+        raise CompressionError("تعذّر قراءة مدة الملف أو مسار الصوت/الصورة.") from exc
 
 
 def compress_video(source: Path) -> Path:
@@ -270,6 +404,37 @@ def compress_video(source: Path) -> Path:
     raise CompressionError("تعذّر تقليل حجم الفيديو إلى أقل من 50MB.")
 
 
+def compress_audio(source: Path) -> Path:
+    require_media_tools()
+    duration, _ = probe_media(source, audio_only=True)
+    encode_dir = Path(tempfile.mkdtemp(prefix="audio-", dir=source.parent))
+    output = encode_dir / "audio.mp3"
+    target = COMPRESSION_TARGET_BYTES
+    rates = (192_000, 160_000, 128_000, 112_000, 96_000, 80_000, 64_000,
+             56_000, 48_000, 40_000, 32_000)
+    for _ in range(2):
+        bitrate = next((rate for rate in rates if rate <= target * 8 / duration), None)
+        if bitrate is None:
+            raise CompressionError("الصوت طويل جدًا لإرساله تحت 50MB دون تقطيعه.")
+        run_media_command([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+            "-i", str(source), "-map", "0:a:0", "-vn", "-c:a", "libmp3lame",
+            "-b:a", str(bitrate), "-ac", "2", "-map_metadata", "-1",
+            "-map_chapters", "-1", str(output),
+        ], COMPRESSION_TIMEOUT_SECONDS)
+        size = output.stat().st_size if output.is_file() else 0
+        if not size:
+            raise CompressionError("لم تنتج المعالجة ملف صوت صالحًا.")
+        if size < MAX_FILE_SIZE_BYTES:
+            output_duration, _ = probe_media(output, audio_only=True)
+            if abs(output_duration - duration) > max(1.0, duration * 0.01):
+                raise CompressionError("ملف الصوت غير مكتمل؛ لم يتم إرساله.")
+            return output
+        target = min(int(target * COMPRESSION_TARGET_BYTES / size * 0.9),
+                     int(bitrate * duration / 8 * 0.9))
+    raise CompressionError("تعذّر تقليل حجم الصوت إلى أقل من 50MB.")
+
+
 async def run_media_worker(function, *args):
     # Cancellation must not remove a directory while its worker still writes to it.
     task = asyncio.create_task(asyncio.to_thread(function, *args))
@@ -291,18 +456,23 @@ async def download_media_async(url: str, out_dir: Path):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(
-            "أهلًا! ابعت رابط فيديو من تويتر/X أو إنستغرام أو تيك توك 🎬\n"
-            "أضغط الفيديو الكبير تلقائيًا ليصبح أقل من 50MB."
+            "أهلًا! ابعت رابط منشور من تويتر/X أو إنستغرام أو تيك توك 👋\n"
+            "ثم اختر: 🎬 فيديو، 🎵 صوت MP3، أو 🖼 صور.\n"
+            "أضغط الفيديو أو الصوت الكبير تلقائيًا تحت 50MB."
         )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(
-            "أرسل رابط منشور فيديو من تويتر/X أو إنستغرام أو تيك توك.\n"
+            "أرسل رابط منشور من تويتر/X أو إنستغرام أو تيك توك واختر نوع التحميل.\n"
+            "🎵 الصوت: استخراج MP3 من رابط الفيديو، وليس رابط اسم أغنية.\n"
+            "🖼 الصور: صور المنشور الأصلي، حتى 20 صورة؛ ليست لقطات من الفيديو.\n"
+            "الأوامر المباشرة: /video أو /audio أو /photos ثم الرابط.\n"
             "التحميل بدون كوكيز حساب؛ المحتوى الذي تطلب المنصة تسجيل دخول له غير مدعوم.\n"
             "إذا احتوى المنشور عدة فيديوهات، يُحمّل أول فيديو فقط.\n"
-            "ضغط الفيديو الكبير قد يستغرق عدة دقائق."
+            "الخيارات صالحة 15 دقيقة وتُلغى عند إعادة تشغيل البوت؛ أعد إرسال الرابط عند الحاجة.\n"
+            "معالجة الملفات الكبيرة قد تستغرق عدة دقائق."
         )
 
 
@@ -320,33 +490,157 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = extract_supported_url(update.message.text or "")
     if not url:
         await update.message.reply_text(
-            "أرسل رابط فيديو من تويتر/X أو إنستغرام أو تيك توك فقط."
+            "أرسل رابط منشور من تويتر/X أو إنستغرام أو تيك توك فقط."
         )
         return
+    if not update.effective_user:
+        return
+    choices = context.user_data.setdefault("media_choices", {})
+    now = time.monotonic()
+    for key, item in list(choices.items()):
+        if now - item["created"] >= CHOICE_TTL_SECONDS:
+            choices.pop(key, None)
+    while len(choices) >= 10:
+        choices.pop(next(iter(choices)))
+    request_id = secrets.token_hex(6)
+    choices[request_id] = dict(url=url, created=now, chat_id=update.effective_chat.id,
+                               user_id=update.effective_user.id)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎬 فيديو", callback_data=f"media:video:{request_id}"),
+        InlineKeyboardButton("🎵 صوت MP3", callback_data=f"media:audio:{request_id}"),
+        InlineKeyboardButton("🖼 صور", callback_data=f"media:photos:{request_id}"),
+    ]])
+    try:
+        await update.message.reply_text("شو بدك تحمّل من هذا الرابط؟", reply_markup=keyboard)
+    except Exception:
+        choices.pop(request_id, None)
+        raise
+
+
+async def media_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not isinstance(query.data, str):
+        return
+    match = re.fullmatch(r"media:(video|audio|photos):([0-9a-f]{12})", query.data)
+    choices = context.user_data.get("media_choices", {})
+    item = choices.get(match[2]) if match else None
+    if (not item or not update.effective_chat or not update.effective_user
+            or item["user_id"] != update.effective_user.id
+            or item["chat_id"] != update.effective_chat.id
+            or time.monotonic() - item["created"] >= CHOICE_TTL_SECONDS):
+        await query.answer("الخيارات انتهت أو ليست لك. أعد إرسال الرابط.", show_alert=True)
+        return
+    # Consume before the first await: duplicate clicks cannot download twice.
+    choices.pop(match[2])
+    try:
+        await query.answer("تم اختيار " + MEDIA_MODES[match[1]])
+    except Exception:
+        # Telegram can expire the callback while Render wakes from idle.
+        logger.warning("Could not acknowledge media choice")
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        logger.warning("Could not remove media buttons")
+    await process_media(update, context, item["url"], match[1])
+
+
+async def media_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    mode = (update.message.text or "").split()[0].split("@")[0].lstrip("/").lower()
+    url = extract_supported_url(" ".join(context.args or []))
+    if mode not in MEDIA_MODES or not url:
+        await update.message.reply_text("اكتب /video أو /audio أو /photos ثم رابط المنشور المدعوم.")
+        return
+    await process_media(update, context, url, mode)
+
+
+async def send_photos(message, paths: list[Path]):
+    # Prepare every image before any upload, so corrupt downloads are not a partial success.
+    prepared = [await run_media_worker(prepare_photo, path) for path in paths]
+    album = []
+
+    async def flush():
+        if len(album) == 1:
+            with album[0].open("rb") as photo:
+                await message.reply_photo(photo=photo, caption="✅ تفضل صورتك", **UPLOAD_TIMEOUTS)
+        elif album:
+            await message.reply_media_group(
+                media=[InputMediaPhoto(path, caption="✅ تفضل صور المنشور" if i == 0 else None)
+                       for i, path in enumerate(album)], **UPLOAD_TIMEOUTS,
+            )
+        album.clear()
+
+    for path, as_document in prepared:
+        if as_document:
+            await flush()
+            with path.open("rb") as document:
+                await message.reply_document(
+                    document=document, caption="🖼 الصورة الأصلية كملف بسبب أبعادها أو حجمها",
+                    **UPLOAD_TIMEOUTS,
+                )
+        else:
+            album.append(path)
+            if len(album) == 10:
+                await flush()
+    await flush()
+
+
+async def process_media(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, mode: str):
+    message = update.effective_message
+    if not message or mode not in MEDIA_MODES:
+        return
+    state = context.bot_data
+    # One expensive media worker on the Free instance, with at most three waiting requests.
+    if state.get("media_jobs", 0) >= 4:
+        await message.reply_text("البوت مشغول حاليًا. أعد إرسال الرابط بعد قليل.")
+        return
+    state["media_jobs"] = state.get("media_jobs", 0) + 1
+    semaphore = state.setdefault("media_semaphore", asyncio.Semaphore(1))
     status = None
     request_dir = None
     try:
-        status = await update.message.reply_text("⏳ جاري تنزيل الفيديو...")
-        request_dir = Path(tempfile.mkdtemp(prefix="request-", dir=DOWNLOAD_DIR))
-        file_path, _ = await download_media_async(url, request_dir)
-        if file_path.stat().st_size >= MAX_FILE_SIZE_BYTES:
-            await edit_status(status, "🗜️ جاري ضغط الفيديو إلى أقل من 50MB؛ قد يستغرق عدة دقائق...")
-            file_path = await run_media_worker(compress_video, file_path)
-        if not 0 < file_path.stat().st_size < MAX_FILE_SIZE_BYTES:
-            raise CompressionError("حجم الملف غير مناسب للرفع؛ لم يتم إرساله.")
-        await edit_status(status, f"📤 جاري رفع الفيديو ({file_path.stat().st_size / 1_000_000:.1f}MB)...")
-        try:
-            await context.bot.send_chat_action(
-                chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VIDEO
-            )
-        except Exception:
-            logger.warning("Could not send chat action")
-        with file_path.open("rb") as video_file:
-            await update.message.reply_video(
-                video=video_file, caption="✅ تفضل فيديوك",
-                supports_streaming=True, write_timeout=180,
-                read_timeout=180, connect_timeout=30,
-            )
+        status = await message.reply_text(
+            "⏳ طلبك بانتظار انتهاء التحميل السابق..." if semaphore.locked()
+            else f"⏳ جاري تنزيل {MEDIA_MODES[mode]}..."
+        )
+        async with semaphore:
+            await edit_status(status, f"⏳ جاري تنزيل {MEDIA_MODES[mode]}...")
+            request_dir = Path(tempfile.mkdtemp(prefix="request-", dir=DOWNLOAD_DIR))
+            if mode == "photos":
+                paths = await run_media_worker(download_photos, url, request_dir)
+                await edit_status(status, f"📤 جاري تجهيز وإرسال {len(paths)} صورة (حتى {MAX_PHOTOS})...")
+                await send_photos(message, paths)
+            else:
+                if mode == "audio":
+                    file_path, _ = await run_media_worker(download_media, url, request_dir, "audio")
+                    # A renamed/invalid file must not be sent as a playable audio track.
+                    await run_media_worker(lambda path: probe_media(path, audio_only=True), file_path)
+                else:
+                    file_path, _ = await download_media_async(url, request_dir)
+                if file_path.stat().st_size >= MAX_FILE_SIZE_BYTES:
+                    await edit_status(status, f"🗜️ جاري ضغط {MEDIA_MODES[mode]} تحت 50MB؛ قد يستغرق دقائق...")
+                    file_path = await run_media_worker(
+                        compress_audio if mode == "audio" else compress_video, file_path,
+                    )
+                if not 0 < file_path.stat().st_size < MAX_FILE_SIZE_BYTES:
+                    raise CompressionError("حجم الملف غير مناسب للرفع؛ لم يتم إرساله.")
+                await edit_status(status, f"📤 جاري رفع {MEDIA_MODES[mode]} ({file_path.stat().st_size / 1_000_000:.1f}MB)...")
+                try:
+                    await context.bot.send_chat_action(
+                        chat_id=update.effective_chat.id,
+                        action=ChatAction.UPLOAD_VOICE if mode == "audio" else ChatAction.UPLOAD_VIDEO,
+                    )
+                except Exception:
+                    logger.warning("Could not send chat action")
+                with file_path.open("rb") as media_file:
+                    if mode == "audio":
+                        await message.reply_audio(audio=media_file, caption="✅ تفضل الصوت بصيغة MP3",
+                                                  **UPLOAD_TIMEOUTS)
+                    else:
+                        await message.reply_video(video=media_file, caption="✅ تفضل فيديوك",
+                                                  supports_streaming=True, **UPLOAD_TIMEOUTS)
+        logger.info("Media sent successfully: mode=%s", mode)
         try:
             await status.delete()
         except Exception:
@@ -355,8 +649,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_status(status, f"❌ {exc}")
     except Exception:
         logger.exception("Download/upload request failed")
-        await edit_status(status, "❌ حدث خطأ أثناء تجهيز الفيديو أو إرساله. حاول لاحقًا.")
+        text = "❌ تعذّر تجهيز الملفات أو إرسالها بالكامل. حاول لاحقًا."
+        if mode == "photos":
+            text += " قد تكون بعض الصور وصلت بالفعل."
+        await edit_status(status, text)
     finally:
+        state["media_jobs"] -= 1
         if request_dir:
             try:
                 shutil.rmtree(request_dir)
@@ -440,7 +738,7 @@ def create_web_app(application, base_url: str, token: str) -> web.Application:
                 await application.bot.set_webhook(
                     url=f"{base_url.rstrip('/')}{WEBHOOK_PATH}",
                     secret_token=secret,
-                    allowed_updates=["message"],
+                    allowed_updates=["message", "callback_query"],
                     max_connections=4,
                     drop_pending_updates=False,
                 )
@@ -466,6 +764,8 @@ def create_application(token: str, *, webhook: bool):
     application = builder.build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler(["video", "audio", "photos"], media_command, block=False))
+    application.add_handler(CallbackQueryHandler(media_choice, pattern=r"^media:", block=False))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     application.add_error_handler(on_error)
     return application
@@ -476,8 +776,8 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN غير موجود.")
     require_media_tools()
-    logger.info("Runtime: yt-dlp=%s; curl-cffi=%s",
-                version("yt-dlp"), version("curl-cffi"))
+    logger.info("Runtime: yt-dlp=%s; curl-cffi=%s; gallery-dl=%s",
+                version("yt-dlp"), version("curl-cffi"), version("gallery-dl"))
     base_url = (os.environ.get("WEBHOOK_URL", "").strip()
                 or os.environ.get("RENDER_EXTERNAL_URL", "").strip())
     port = int(os.environ.get("PORT", "10000"))
@@ -497,7 +797,7 @@ def main():
         app = create_application(BOT_TOKEN, webhook=False)
         logger.info("Bot started")
         # A stopped/closed Application must not be reused in an infinite retry loop.
-        app.run_polling(allowed_updates=["message"], drop_pending_updates=False)
+        app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=False)
     finally:
         server.shutdown()
         server.server_close()
