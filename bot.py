@@ -448,8 +448,146 @@ def build_gallery_command(url: str, out_dir: Path) -> list[str]:
     ]
 
 
+def is_instagram_image_url(url: str) -> bool:
+    """Only accept HTTPS image links returned by Instagram's own CDN."""
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        return (parsed.scheme == "https" and not parsed.username and not parsed.password
+                and parsed.port in (None, 443)
+                and any(host == domain or host.endswith("." + domain)
+                        for domain in ("cdninstagram.com", "fbcdn.net")))
+    except (ValueError, TypeError):
+        return False
+
+
+def select_instagram_photo_urls(product: dict) -> list[str]:
+    """Select real photo items, never video thumbnails, in carousel order."""
+    if isinstance(product, list):
+        product = product[0] if product else None
+    if not isinstance(product, dict):
+        raise DownloadFailure("إنستغرام لم يُرجع بيانات صور صالحة لهذا المنشور.")
+    items = product.get("carousel_media") if product.get("media_type") == 8 else [product]
+    urls = []
+    for item in items or []:
+        if (not isinstance(item, dict) or item.get("media_type") != 1
+                or item.get("video_versions") or item.get("video_dash_manifest")):
+            continue
+        candidates = (item.get("image_versions2") or {}).get("candidates") or []
+        candidates = [c for c in candidates if isinstance(c, dict)
+                      and isinstance(c.get("url"), str) and is_instagram_image_url(c["url"])]
+        if not candidates:
+            raise DownloadFailure("تعذّر الحصول على رابط صورة صالح من إنستغرام.")
+        # Some logged-out responses omit dimensions; retain their first candidate.
+        best = max(candidates, key=lambda c: (c.get("width") or 0) * (c.get("height") or 0))
+        urls.append(best["url"])
+        if len(urls) == MAX_PHOTOS:
+            break
+    if not urls:
+        raise DownloadFailure("لا توجد صور قابلة للتنزيل في هذا المنشور؛ أغلفة الفيديو ليست صور منشور.")
+    return urls
+
+
+def extract_instagram_photo_urls(url: str) -> list[str]:
+    # Use the pinned extractor's ungated/logged-out post response. This local
+    # subclass intercepts photo metadata without changing the video/audio extractor.
+    from yt_dlp.extractor.instagram import InstagramIE
+
+    class PhotoMetadata(Exception):
+        def __init__(self, product):
+            self.product = product
+
+    class PhotoExtractor(InstagramIE):
+        def _extract_product(self, product_info, *args, **kwargs):
+            raise PhotoMetadata(product_info)
+
+    options = {
+        "quiet": True, "skip_download": True, "logger": YTDLPLogger(),
+        "socket_timeout": PHOTO_HTTP_TIMEOUT_SECONDS, "retries": 0,
+        "extractor_retries": 0, "cookiefile": None, "cookiesfrombrowser": None,
+        "usenetrc": False,
+    }
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            PhotoExtractor(ydl).extract(url)
+    except PhotoMetadata as metadata:
+        return select_instagram_photo_urls(metadata.product)
+    except yt_dlp.utils.ExtractorError as exc:
+        raise DownloadFailure(download_error_message(exc)) from exc
+    raise DownloadFailure("إنستغرام لم يُرجع صور هذا المنشور.")
+
+
+def open_instagram_photo(url: str):
+    from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, request, fp, code, msg, headers, newurl):
+            return None
+
+    if not is_instagram_image_url(url):
+        raise DownloadFailure("رابط الصورة ليس من خادم صور إنستغرام المسموح.")
+    # No account cookies, automatic retries, or redirects to arbitrary hosts.
+    return build_opener(NoRedirect()).open(
+        Request(url, headers={"Referer": "https://www.instagram.com/"}),
+        timeout=PHOTO_HTTP_TIMEOUT_SECONDS,
+    )
+
+
+def download_instagram_photos(url: str, out_dir: Path):
+    url = photo_post_url(url)
+    if (urlsplit(url).hostname or "").lower() not in ("instagram.com", "www.instagram.com"):
+        raise DownloadFailure("أداة صور إنستغرام تقبل منشور إنستغرام فقط.")
+    urls = extract_instagram_photo_urls(url)
+    extensions = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp", "AVIF": "avif", "GIF": "gif"}
+    for number, image_url in enumerate(urls, 1):
+        partial = out_dir / f"{number:03}.image.part"
+        try:
+            with open_instagram_photo(image_url) as response, partial.open("wb") as output:
+                declared = response.headers.get("Content-Length", "")
+                if declared.isdecimal() and int(declared) >= MAX_FILE_SIZE_BYTES:
+                    raise DownloadFailure("حجم الصورة يتجاوز الحد المسموح لإرسالها.")
+                size = 0
+                while chunk := response.read(64 * 1024):
+                    size += len(chunk)
+                    if size >= MAX_FILE_SIZE_BYTES:
+                        raise DownloadFailure("حجم الصورة يتجاوز الحد المسموح لإرسالها.")
+                    output.write(chunk)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(partial) as image:
+                    extension = extensions.get(image.format)
+                    if not extension:
+                        raise DownloadFailure("صيغة الصورة غير مدعومة.")
+                    image.verify()
+            partial.replace(out_dir / f"{number:03}.{extension}")
+        except DownloadFailure:
+            raise
+        except (OSError, ValueError, Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
+            raise DownloadFailure(download_error_message(exc)) from exc
+        finally:
+            partial.unlink(missing_ok=True)
+    logger.info("Instagram photos downloaded successfully: count=%s", len(urls))
+
+
+def instagram_photo_worker_main(url: str, out_dir: Path) -> int:
+    configure_logging()
+    try:
+        download_instagram_photos(url, out_dir)
+    except DownloadFailure as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=True))
+        return 1
+    except Exception as exc:
+        logger.warning("Instagram photo worker failed: %s", type(exc).__name__)
+        print(json.dumps({"error": "تعذّر تنزيل صور المنشور. جرّب لاحقًا."}, ensure_ascii=True))
+        return 1
+    return 0
+
+
 def download_photos(url: str, out_dir: Path) -> list[Path]:
-    command = build_gallery_command(photo_post_url(url), out_dir)
+    url = photo_post_url(url)
+    instagram = (urlsplit(url).hostname or "").lower() in ("instagram.com", "www.instagram.com")
+    command = ([sys.executable, str(Path(__file__).resolve()), "--instagram-photos",
+                url, str(out_dir.resolve())] if instagram else build_gallery_command(url, out_dir))
     try:
         result = subprocess.run(
             command, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -464,6 +602,13 @@ def download_photos(url: str, out_dir: Path) -> list[Path]:
         raise DownloadFailure("تعذّر تشغيل أداة تحميل الصور على الخادم.") from exc
     if result.returncode:
         logger.warning("Photo download failed: %s", result.stderr[-2000:])
+        if instagram:
+            try:
+                error = json.loads(getattr(result, "stdout", ""))["error"]
+                if isinstance(error, str) and error and len(error) < 600:
+                    raise DownloadFailure(error)
+            except (ValueError, KeyError, TypeError):
+                pass
         raise DownloadFailure(download_error_message(Exception(result.stderr)))
     photos = []
     for path in sorted(out_dir.iterdir()):
@@ -1041,4 +1186,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--instagram-photos"]:
+        if len(sys.argv) != 4:
+            raise SystemExit(2)
+        raise SystemExit(instagram_photo_worker_main(sys.argv[2], Path(sys.argv[3])))
     main()
