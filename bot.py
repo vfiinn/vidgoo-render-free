@@ -53,6 +53,7 @@ NO_AUDIO_MESSAGE = (
     "تعذّر الحصول على مسار صوت من هذا المنشور. قد لا تتيح المنصة الصوت لهذا الخادم "
     "أو قد يكون المقطع بلا صوت. لم يتم إنشاء ملف MP3 صامت."
 )
+INSTAGRAM_COMPLETE_FORMAT = "best*[format_id!^=dash-][vcodec!=?none]"
 
 
 class SafeFormatter(logging.Formatter):
@@ -105,8 +106,12 @@ class YTDLPLogger:
 
 
 def build_ydl_options(out_dir: Path, url: str = "", mode: str = "video") -> dict:
+    host = (urlsplit(url).hostname or "").lower()
+    instagram = host == "instagram.com" or host.endswith(".instagram.com")
     options = {
-        "format": "bv*+ba/b",
+        # Prefer Instagram's complete MP4: it often has sound even when the DASH
+        # response exposes only video. Other platforms retain their original selector.
+        "format": f"{INSTAGRAM_COMPLETE_FORMAT}/bv+ba/b" if instagram else "bv*+ba/b",
         "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
         "noplaylist": True,
         "playlist_items": "1",
@@ -133,6 +138,8 @@ def build_ydl_options(out_dir: Path, url: str = "", mode: str = "video") -> dict
     if mode == "audio":
         # Prefer audio; unknown codecs are checked against the downloaded file.
         options["format"] = "bestaudio/best*[acodec!=none]/best*[acodec!=?none]"
+        if instagram:
+            options["format"] = f"bestaudio/{INSTAGRAM_COMPLETE_FORMAT}/best*[acodec!=none]"
         options.pop("merge_output_format", None)
         # Probe the source before converting, never extract from a video-only DASH track.
         options["postprocessors"] = []
@@ -256,15 +263,15 @@ def download_media_attempt(url: str, out_dir: Path, mode: str, *,
 
 
 def audio_fallback_selectors(info: dict, mode: str, excluded: set[str]):
-    """Known audio first, then progressive alternatives whose codecs are unknown."""
+    """Known audio first, then verify progressive files regardless of metadata flags."""
     formats = list(reversed(info.get("formats") or []))
     audio = [f for f in formats if f.get("vcodec") == "none"
              and f.get("acodec") not in (None, "none")]
     videos = [f for f in formats if f.get("vcodec") != "none"]
     combined = [f for f in videos if f.get("acodec") not in (None, "none")]
-    unknown = [f for f in videos if f.get("acodec") is None
-               and not str(f.get("format_id", "")).startswith("dash-")
-               and f.get("protocol") not in ("http_dash_segments", "m3u8", "m3u8_native")]
+    progressive = [f for f in videos
+                   if not str(f.get("format_id", "")).startswith("dash-")
+                   and f.get("protocol") not in ("http_dash_segments", "m3u8", "m3u8_native")]
     selectors = []
     if mode == "audio":
         selectors.extend(f.get("format_id") for f in audio)
@@ -273,11 +280,16 @@ def audio_fallback_selectors(info: dict, mode: str, excluded: set[str]):
         mergeable = [f for f in videos if f.get("acodec") in (None, "none")]
         if mergeable:
             selectors.append(f"{mergeable[0]['format_id']}+{audio[0]['format_id']}")
-    selectors.extend(f.get("format_id") for f in combined + unknown)
+    selectors.extend(f.get("format_id") for f in combined + progressive)
     seen = set(excluded)
+    urls = {str(f.get("format_id")): f.get("url") for f in formats}
+    def signature(selector):
+        return tuple(urls.get(item) or f"format:{item}" for item in selector.split("+"))
+    seen_files = {signature(selector) for selector in excluded}
     for selector in selectors:
-        if selector and selector not in seen:
+        if selector and selector not in seen and signature(selector) not in seen_files:
             seen.add(selector)
+            seen_files.add(signature(selector))
             yield selector
 
 
@@ -310,6 +322,11 @@ def recover_download_audio(url: str, out_dir: Path, mode: str, original: dict):
         for fmt in metadata.get("formats") or []:
             if fmt.get("format_id") == original.get("format_id"):
                 fmt["acodec"] = "none"
+        # Diagnostic codec flags only: never log signed CDN URLs or account cookies.
+        logger.info("Audio recovery formats: id=%s formats=%s", metadata.get("id"), [
+            {key: fmt.get(key) for key in ("format_id", "vcodec", "acodec", "protocol")}
+            for fmt in (metadata.get("formats") or [])[:24]
+        ])
     attempts = 0
     for metadata in metadata_sets:
         for selector in audio_fallback_selectors(metadata, mode, excluded):
@@ -330,6 +347,7 @@ def recover_download_audio(url: str, out_dir: Path, mode: str, original: dict):
                 logger.warning("Alternate format still has no audio stream: %s", selector)
             except yt_dlp.utils.DownloadError as exc:
                 raise DownloadFailure(download_error_message(exc)) from exc
+    logger.warning("Audio recovery exhausted without a verified audio stream: attempts=%s", attempts)
     return None
 
 
@@ -855,7 +873,10 @@ async def process_media(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
                         )
                         await message.reply_video(video=media_file, caption=caption,
                                                   supports_streaming=True, **UPLOAD_TIMEOUTS)
-        logger.info("Media sent successfully: mode=%s", mode)
+        if mode == "video":
+            logger.info("Media sent successfully: mode=video has_audio=%s", video_has_audio)
+        else:
+            logger.info("Media sent successfully: mode=%s", mode)
         try:
             await status.delete()
         except Exception:
@@ -993,6 +1014,7 @@ def main():
     require_media_tools()
     logger.info("Runtime: yt-dlp=%s; curl-cffi=%s; gallery-dl=%s",
                 version("yt-dlp"), version("curl-cffi"), version("gallery-dl"))
+    logger.info("Instagram strategy: complete MP4 first; verify actual audio streams")
     base_url = (os.environ.get("WEBHOOK_URL", "").strip()
                 or os.environ.get("RENDER_EXTERNAL_URL", "").strip())
     port = int(os.environ.get("PORT", "10000"))
