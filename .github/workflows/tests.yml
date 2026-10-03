@@ -1,0 +1,36 @@
+name: Offline media tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install FFmpeg and Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install -r requirements.txt
+      - name: Verify dependencies and source
+        run: |
+          ffmpeg -version
+          ffprobe -version
+          python -m pip check
+          python -m py_compile bot.py
+      - name: Run offline regression tests
+        run: python -m unittest discover -s tests -v
