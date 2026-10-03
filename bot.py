@@ -1,5 +1,6 @@
 """Download public videos, MP3 audio and post photos from X, Instagram and TikTok."""
 import asyncio
+import copy
 import hashlib
 import hmac
 import json
@@ -48,6 +49,11 @@ PHOTO_HTTP_TIMEOUT_SECONDS = 12
 PHOTO_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "avif", "gif")
 CHOICE_TTL_SECONDS = 15 * 60
 UPLOAD_TIMEOUTS = dict(write_timeout=180, read_timeout=180, connect_timeout=30)
+NO_AUDIO_MESSAGE = (
+    "تعذّر الحصول على مسار صوت من هذا المنشور. قد لا تتيح المنصة الصوت لهذا الخادم "
+    "أو قد يكون المقطع بلا صوت. لم يتم إنشاء ملف MP3 صامت."
+)
+INSTAGRAM_COMPLETE_FORMAT = "best*[format_id!^=dash-][vcodec!=?none]"
 
 
 class SafeFormatter(logging.Formatter):
@@ -100,8 +106,12 @@ class YTDLPLogger:
 
 
 def build_ydl_options(out_dir: Path, url: str = "", mode: str = "video") -> dict:
+    host = (urlsplit(url).hostname or "").lower()
+    instagram = host == "instagram.com" or host.endswith(".instagram.com")
     options = {
-        "format": "bv*+ba/b",
+        # Prefer Instagram's complete MP4: it often has sound even when the DASH
+        # response exposes only video. Other platforms retain their original selector.
+        "format": f"{INSTAGRAM_COMPLETE_FORMAT}/bv+ba/b" if instagram else "bv*+ba/b",
         "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
         "noplaylist": True,
         "playlist_items": "1",
@@ -126,11 +136,13 @@ def build_ydl_options(out_dir: Path, url: str = "", mode: str = "video") -> dict
         "no_warnings": False,
     }
     if mode == "audio":
-        options["format"] = "bestaudio/best"
+        # Prefer audio; unknown codecs are checked against the downloaded file.
+        options["format"] = "bestaudio/best*[acodec!=none]/best*[acodec!=?none]"
+        if instagram:
+            options["format"] = f"bestaudio/{INSTAGRAM_COMPLETE_FORMAT}/best*[acodec!=none]"
         options.pop("merge_output_format", None)
-        options["postprocessors"] = [{
-            "key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192",
-        }]
+        # Probe the source before converting, never extract from a video-only DASH track.
+        options["postprocessors"] = []
     elif mode != "video":
         raise ValueError("Unsupported yt-dlp mode")
     return options
@@ -142,6 +154,8 @@ class DownloadFailure(RuntimeError):
 
 def download_error_message(error: Exception) -> str:
     message = str(error).lower()
+    if "unable to obtain file audio codec" in message:
+        return NO_AUDIO_MESSAGE
     if "suspended" in message:
         return "المنصة أبلغت أن الحساب أو المحتوى موقوف. جرّب رابطًا آخر."
     if "empty media response" in message:
@@ -172,13 +186,20 @@ def find_downloaded_file(info: dict, out_dir: Path, prepared_filename: str,
                          mode: str = "video") -> Path:
     root = out_dir.resolve()
     prepared = Path(prepared_filename)
-    extension = ".mp3" if mode == "audio" else ".mp4"
+    extension = prepared.suffix if mode == "source" else (".mp3" if mode == "audio" else ".mp4")
     candidates = [prepared.with_suffix(extension), prepared]
+    if info.get("filepath"):
+        candidates.append(Path(info["filepath"]))
     for item in info.get("requested_downloads") or []:
         if item.get("filepath"):
             candidates.append(Path(item["filepath"]))
     candidates.extend(out_dir.glob("*" + extension))
-    allowed = (".mp3",) if mode == "audio" else (".mp4", ".mkv", ".webm", ".mov")
+    allowed = {
+        "audio": (".mp3",),
+        "video": (".mp4", ".mkv", ".webm", ".mov"),
+        "source": (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac",
+                   ".mp4", ".mkv", ".webm", ".mov"),
+    }[mode]
     for candidate in candidates:
         candidate = candidate.resolve()
         if (candidate.parent == root and candidate.is_file()
@@ -189,20 +210,191 @@ def find_downloaded_file(info: dict, out_dir: Path, prepared_filename: str,
                           else "لم ينتج التنزيل ملف فيديو مكتملًا.")
 
 
+def is_instagram_reel(url: str) -> bool:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    return (host == "instagram.com" or host.endswith(".instagram.com")) and bool(
+        re.fullmatch(r"/(?:reels?|tv)/[A-Za-z0-9_-]+/?", parsed.path)
+    )
+
+
+def canonical_media_url(url: str) -> str:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    if host == "instagram.com" or host.endswith(".instagram.com"):
+        match = re.fullmatch(r"/(p|reels?|tv)/([A-Za-z0-9_-]+)/?", parsed.path)
+        if match:
+            kind = "reel" if match[1] in ("reel", "reels") else match[1]
+            return f"https://www.instagram.com/{kind}/{match[2]}/"
+    return url
+
+
+def first_media_entry(info: dict | None):
+    while info and info.get("_type") in ("playlist", "multi_video"):
+        info = next((entry for entry in info.get("entries") or [] if entry), None)
+    if not info:
+        raise DownloadFailure("الرابط لم يُرجع وسائط قابلة للتنزيل.")
+    return info
+
+
+def download_media_attempt(url: str, out_dir: Path, mode: str, *,
+                           metadata: dict | None = None, selector: str | None = None):
+    options = build_ydl_options(out_dir, url, mode)
+    if selector:
+        options["format"] = selector
+    with yt_dlp.YoutubeDL(options) as ydl:
+        if metadata is None:
+            info = ydl.extract_info(url, download=True)
+        else:
+            # Strip previous download state so a new selector cannot reuse an old merge.
+            clean = copy.deepcopy(metadata)
+            for key in ("requested_downloads", "requested_formats", "_filename", "filepath",
+                        "__files_to_move", "url", "format_id", "ext", "protocol", "vcodec", "acodec",
+                        "manifest_url", "manifest_stream_number", "format", "format_note", "container",
+                        "filesize", "filesize_approx", "width", "height", "resolution", "fps", "abr",
+                        "vbr", "tbr", "asr", "audio_channels", "fragments", "fragment_base_url",
+                        "hls_media_playlist_data", "hls_aes", "request_data", "downloader_options"):
+                clean.pop(key, None)
+            info = ydl.process_ie_result(clean, download=True)
+        info = first_media_entry(info)
+        source_mode = "source" if mode == "audio" else "video"
+        path = find_downloaded_file(info, out_dir, ydl.prepare_filename(info), source_mode)
+        return path, info
+
+
+def audio_fallback_selectors(info: dict, mode: str, excluded: set[str]):
+    """Known audio first, then verify progressive files regardless of metadata flags."""
+    formats = list(reversed(info.get("formats") or []))
+    audio = [f for f in formats if f.get("vcodec") == "none"
+             and f.get("acodec") not in (None, "none")]
+    videos = [f for f in formats if f.get("vcodec") != "none"]
+    combined = [f for f in videos if f.get("acodec") not in (None, "none")]
+    progressive = [f for f in videos
+                   if not str(f.get("format_id", "")).startswith("dash-")
+                   and f.get("protocol") not in ("http_dash_segments", "m3u8", "m3u8_native")]
+    selectors = []
+    if mode == "audio":
+        selectors.extend(f.get("format_id") for f in audio)
+    elif audio and videos:
+        # A claimed combined track would cause yt-dlp to omit the extra audio.
+        mergeable = [f for f in videos if f.get("acodec") in (None, "none")]
+        if mergeable:
+            selectors.append(f"{mergeable[0]['format_id']}+{audio[0]['format_id']}")
+    selectors.extend(f.get("format_id") for f in combined + progressive)
+    seen = set(excluded)
+    urls = {str(f.get("format_id")): f.get("url") for f in formats}
+    def signature(selector):
+        return tuple(urls.get(item) or f"format:{item}" for item in selector.split("+"))
+    seen_files = {signature(selector) for selector in excluded}
+    for selector in selectors:
+        if selector and selector not in seen and signature(selector) not in seen_files:
+            seen.add(selector)
+            seen_files.add(signature(selector))
+            yield selector
+
+
+def validate_download_audio(path: Path, mode: str):
+    _, has_audio = probe_media(path, audio_only=(mode == "audio"))
+    if not has_audio:
+        raise MissingAudioStream(NO_AUDIO_MESSAGE)
+
+
+def recover_download_audio(url: str, out_dir: Path, mode: str, original: dict):
+    metadata_sets = [original]
+    host = (urlsplit(url).hostname or "").lower()
+    if host == "instagram.com" or host.endswith(".instagram.com"):
+        # A successful Instagram response sometimes omits its audio adaptation.
+        # Refresh once only; a blocked/login-required response stops the request.
+        options = build_ydl_options(out_dir, url, "video")
+        options.update(socket_timeout=12, extractor_retries=0, retries=0)
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                refreshed = first_media_entry(ydl.extract_info(url, download=False))
+            metadata_sets.insert(0, refreshed)
+        except yt_dlp.utils.DownloadError as exc:
+            logger.warning("Audio metadata refresh failed: %s", exc)
+            raise DownloadFailure(download_error_message(exc)) from exc
+    excluded = {str(original.get("format_id", ""))}
+    # The file itself proved this selected format has no audio, even if its
+    # metadata claimed otherwise. This permits merging it with a separate track.
+    metadata_sets = copy.deepcopy(metadata_sets)
+    for metadata in metadata_sets:
+        for fmt in metadata.get("formats") or []:
+            if fmt.get("format_id") == original.get("format_id"):
+                fmt["acodec"] = "none"
+        # Diagnostic codec flags only: never log signed CDN URLs or account cookies.
+        logger.info("Audio recovery formats: id=%s formats=%s", metadata.get("id"), [
+            {key: fmt.get(key) for key in ("format_id", "vcodec", "acodec", "protocol")}
+            for fmt in (metadata.get("formats") or [])[:24]
+        ])
+    attempts = 0
+    for metadata in metadata_sets:
+        for selector in audio_fallback_selectors(metadata, mode, excluded):
+            if attempts >= 2:
+                return None
+            attempts += 1
+            excluded.add(selector)
+            directory = out_dir / f"audio-fallback-{attempts}"
+            directory.mkdir()
+            logger.info("Trying audio recovery: mode=%s format=%s", mode, selector)
+            try:
+                path, info = download_media_attempt(
+                    url, directory, mode, metadata=metadata, selector=selector,
+                )
+                validate_download_audio(path, mode)
+                return path, info
+            except MissingAudioStream:
+                logger.warning("Alternate format still has no audio stream: %s", selector)
+            except yt_dlp.utils.DownloadError as exc:
+                raise DownloadFailure(download_error_message(exc)) from exc
+    logger.warning("Audio recovery exhausted without a verified audio stream: attempts=%s", attempts)
+    return None
+
+
+def extract_mp3(source: Path) -> Path:
+    duration, _ = probe_media(source, audio_only=True)
+    if source.suffix.lower() == ".mp3":
+        return source
+    directory = Path(tempfile.mkdtemp(prefix="mp3-", dir=source.parent))
+    output = directory / "audio.mp3"
+    run_media_command([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        "-i", str(source), "-map", "0:a:0", "-vn", "-c:a", "libmp3lame",
+        "-b:a", "192k", "-threads", "2", "-map_metadata", "-1",
+        "-map_chapters", "-1", str(output),
+    ], COMPRESSION_TIMEOUT_SECONDS)
+    converted_duration, _ = probe_media(output, audio_only=True)
+    if abs(converted_duration - duration) > 1:
+        raise CompressionError("ملف الصوت المحوّل غير مكتمل؛ لم يتم إرساله.")
+    return output
+
+
 def download_media(url: str, out_dir: Path, mode: str = "video") -> tuple[Path, str | None]:
     if extract_supported_url(url) != url:
         raise DownloadFailure("الروابط المدعومة: تويتر/X وإنستغرام وتيك توك فقط.")
+    url = canonical_media_url(url)
     try:
-        with yt_dlp.YoutubeDL(build_ydl_options(out_dir, url, mode)) as ydl:
-            info = ydl.extract_info(url, download=True)
-            # A post with multiple videos may still return a playlist object.
-            while info and info.get("_type") in ("playlist", "multi_video"):
-                info = next((entry for entry in info.get("entries") or [] if entry), None)
-            if not info:
-                raise DownloadFailure("الرابط لم يُرجع وسائط قابلة للتنزيل.")
-            return find_downloaded_file(info, out_dir, ydl.prepare_filename(info), mode), info.get("id")
+        path, info = download_media_attempt(url, out_dir, mode)
+        try:
+            validate_download_audio(path, mode)
+        except MissingAudioStream:
+            logger.warning("Downloaded format has no audio stream: mode=%s format=%s",
+                           mode, info.get("format_id"))
+            recovered = recover_download_audio(url, out_dir, mode, info)
+            if recovered:
+                path, info = recovered
+            elif mode == "audio":
+                raise DownloadFailure(NO_AUDIO_MESSAGE)
+            # A genuinely silent video is allowed, with an explicit warning caption.
+        return (extract_mp3(path) if mode == "audio" else path), info.get("id")
     except yt_dlp.utils.DownloadError as exc:
         logger.warning("Download failed: %s", exc)
+        if mode == "audio" and "requested format is not available" in str(exc).lower():
+            recovered = recover_download_audio(url, out_dir, mode, {"formats": []})
+            if recovered:
+                path, info = recovered
+                return extract_mp3(path), info.get("id")
+            raise DownloadFailure(NO_AUDIO_MESSAGE) from exc
         raise DownloadFailure(download_error_message(exc)) from exc
 
 
@@ -256,8 +448,146 @@ def build_gallery_command(url: str, out_dir: Path) -> list[str]:
     ]
 
 
+def is_instagram_image_url(url: str) -> bool:
+    """Only accept HTTPS image links returned by Instagram's own CDN."""
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        return (parsed.scheme == "https" and not parsed.username and not parsed.password
+                and parsed.port in (None, 443)
+                and any(host == domain or host.endswith("." + domain)
+                        for domain in ("cdninstagram.com", "fbcdn.net")))
+    except (ValueError, TypeError):
+        return False
+
+
+def select_instagram_photo_urls(product: dict) -> list[str]:
+    """Select real photo items, never video thumbnails, in carousel order."""
+    if isinstance(product, list):
+        product = product[0] if product else None
+    if not isinstance(product, dict):
+        raise DownloadFailure("إنستغرام لم يُرجع بيانات صور صالحة لهذا المنشور.")
+    items = product.get("carousel_media") if product.get("media_type") == 8 else [product]
+    urls = []
+    for item in items or []:
+        if (not isinstance(item, dict) or item.get("media_type") != 1
+                or item.get("video_versions") or item.get("video_dash_manifest")):
+            continue
+        candidates = (item.get("image_versions2") or {}).get("candidates") or []
+        candidates = [c for c in candidates if isinstance(c, dict)
+                      and isinstance(c.get("url"), str) and is_instagram_image_url(c["url"])]
+        if not candidates:
+            raise DownloadFailure("تعذّر الحصول على رابط صورة صالح من إنستغرام.")
+        # Some logged-out responses omit dimensions; retain their first candidate.
+        best = max(candidates, key=lambda c: (c.get("width") or 0) * (c.get("height") or 0))
+        urls.append(best["url"])
+        if len(urls) == MAX_PHOTOS:
+            break
+    if not urls:
+        raise DownloadFailure("لا توجد صور قابلة للتنزيل في هذا المنشور؛ أغلفة الفيديو ليست صور منشور.")
+    return urls
+
+
+def extract_instagram_photo_urls(url: str) -> list[str]:
+    # Use the pinned extractor's ungated/logged-out post response. This local
+    # subclass intercepts photo metadata without changing the video/audio extractor.
+    from yt_dlp.extractor.instagram import InstagramIE
+
+    class PhotoMetadata(Exception):
+        def __init__(self, product):
+            self.product = product
+
+    class PhotoExtractor(InstagramIE):
+        def _extract_product(self, product_info, *args, **kwargs):
+            raise PhotoMetadata(product_info)
+
+    options = {
+        "quiet": True, "skip_download": True, "logger": YTDLPLogger(),
+        "socket_timeout": PHOTO_HTTP_TIMEOUT_SECONDS, "retries": 0,
+        "extractor_retries": 0, "cookiefile": None, "cookiesfrombrowser": None,
+        "usenetrc": False,
+    }
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            PhotoExtractor(ydl).extract(url)
+    except PhotoMetadata as metadata:
+        return select_instagram_photo_urls(metadata.product)
+    except yt_dlp.utils.ExtractorError as exc:
+        raise DownloadFailure(download_error_message(exc)) from exc
+    raise DownloadFailure("إنستغرام لم يُرجع صور هذا المنشور.")
+
+
+def open_instagram_photo(url: str):
+    from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, request, fp, code, msg, headers, newurl):
+            return None
+
+    if not is_instagram_image_url(url):
+        raise DownloadFailure("رابط الصورة ليس من خادم صور إنستغرام المسموح.")
+    # No account cookies, automatic retries, or redirects to arbitrary hosts.
+    return build_opener(NoRedirect()).open(
+        Request(url, headers={"Referer": "https://www.instagram.com/"}),
+        timeout=PHOTO_HTTP_TIMEOUT_SECONDS,
+    )
+
+
+def download_instagram_photos(url: str, out_dir: Path):
+    url = photo_post_url(url)
+    if (urlsplit(url).hostname or "").lower() not in ("instagram.com", "www.instagram.com"):
+        raise DownloadFailure("أداة صور إنستغرام تقبل منشور إنستغرام فقط.")
+    urls = extract_instagram_photo_urls(url)
+    extensions = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp", "AVIF": "avif", "GIF": "gif"}
+    for number, image_url in enumerate(urls, 1):
+        partial = out_dir / f"{number:03}.image.part"
+        try:
+            with open_instagram_photo(image_url) as response, partial.open("wb") as output:
+                declared = response.headers.get("Content-Length", "")
+                if declared.isdecimal() and int(declared) >= MAX_FILE_SIZE_BYTES:
+                    raise DownloadFailure("حجم الصورة يتجاوز الحد المسموح لإرسالها.")
+                size = 0
+                while chunk := response.read(64 * 1024):
+                    size += len(chunk)
+                    if size >= MAX_FILE_SIZE_BYTES:
+                        raise DownloadFailure("حجم الصورة يتجاوز الحد المسموح لإرسالها.")
+                    output.write(chunk)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(partial) as image:
+                    extension = extensions.get(image.format)
+                    if not extension:
+                        raise DownloadFailure("صيغة الصورة غير مدعومة.")
+                    image.verify()
+            partial.replace(out_dir / f"{number:03}.{extension}")
+        except DownloadFailure:
+            raise
+        except (OSError, ValueError, Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
+            raise DownloadFailure(download_error_message(exc)) from exc
+        finally:
+            partial.unlink(missing_ok=True)
+    logger.info("Instagram photos downloaded successfully: count=%s", len(urls))
+
+
+def instagram_photo_worker_main(url: str, out_dir: Path) -> int:
+    configure_logging()
+    try:
+        download_instagram_photos(url, out_dir)
+    except DownloadFailure as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=True))
+        return 1
+    except Exception as exc:
+        logger.warning("Instagram photo worker failed: %s", type(exc).__name__)
+        print(json.dumps({"error": "تعذّر تنزيل صور المنشور. جرّب لاحقًا."}, ensure_ascii=True))
+        return 1
+    return 0
+
+
 def download_photos(url: str, out_dir: Path) -> list[Path]:
-    command = build_gallery_command(photo_post_url(url), out_dir)
+    url = photo_post_url(url)
+    instagram = (urlsplit(url).hostname or "").lower() in ("instagram.com", "www.instagram.com")
+    command = ([sys.executable, str(Path(__file__).resolve()), "--instagram-photos",
+                url, str(out_dir.resolve())] if instagram else build_gallery_command(url, out_dir))
     try:
         result = subprocess.run(
             command, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -272,6 +602,13 @@ def download_photos(url: str, out_dir: Path) -> list[Path]:
         raise DownloadFailure("تعذّر تشغيل أداة تحميل الصور على الخادم.") from exc
     if result.returncode:
         logger.warning("Photo download failed: %s", result.stderr[-2000:])
+        if instagram:
+            try:
+                error = json.loads(getattr(result, "stdout", ""))["error"]
+                if isinstance(error, str) and error and len(error) < 600:
+                    raise DownloadFailure(error)
+            except (ValueError, KeyError, TypeError):
+                pass
         raise DownloadFailure(download_error_message(Exception(result.stderr)))
     photos = []
     for path in sorted(out_dir.iterdir()):
@@ -324,6 +661,10 @@ class CompressionError(RuntimeError):
     """رسالة آمنة يمكن عرضها للمستخدم عند فشل الضغط."""
 
 
+class MissingAudioStream(CompressionError):
+    pass
+
+
 def require_media_tools():
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
@@ -358,6 +699,8 @@ def probe_media(path: Path, *, audio_only: bool = False) -> tuple[float, bool]:
             raise ValueError("Invalid duration")
         required = "audio" if audio_only else "video"
         if not any(s["codec_type"] == required for s in streams):
+            if audio_only and any(s["codec_type"] == "video" for s in streams):
+                raise MissingAudioStream(NO_AUDIO_MESSAGE)
             raise ValueError("Missing required stream")
         return duration, any(s["codec_type"] == "audio" for s in streams)
     except (ValueError, KeyError, TypeError) as exc:
@@ -522,13 +865,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     request_id = secrets.token_hex(6)
     choices[request_id] = dict(url=url, created=now, chat_id=update.effective_chat.id,
                                user_id=update.effective_user.id)
-    keyboard = InlineKeyboardMarkup([[
+    buttons = [
         InlineKeyboardButton("🎬 فيديو", callback_data=f"media:video:{request_id}"),
         InlineKeyboardButton("🎵 صوت MP3", callback_data=f"media:audio:{request_id}"),
-        InlineKeyboardButton("🖼 صور", callback_data=f"media:photos:{request_id}"),
-    ]])
+    ]
+    if not is_instagram_reel(url):
+        buttons.append(InlineKeyboardButton("🖼 صور", callback_data=f"media:photos:{request_id}"))
+    keyboard = InlineKeyboardMarkup([buttons])
+    prompt = ("هذا رابط ريل/فيديو؛ اختر الفيديو أو الصوت. الصور تحتاج رابط منشور صور."
+              if is_instagram_reel(url) else "شو بدك تحمّل من هذا الرابط؟")
     try:
-        await update.message.reply_text("شو بدك تحمّل من هذا الرابط؟", reply_markup=keyboard)
+        await update.message.reply_text(prompt, reply_markup=keyboard)
     except Exception:
         choices.pop(request_id, None)
         raise
@@ -649,6 +996,9 @@ async def process_media(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
                     )
                 if not 0 < file_path.stat().st_size < MAX_FILE_SIZE_BYTES:
                     raise CompressionError("حجم الملف غير مناسب للرفع؛ لم يتم إرساله.")
+                video_has_audio = True
+                if mode == "video":
+                    _, video_has_audio = await run_media_worker(probe_media, file_path)
                 await edit_status(status, f"📤 جاري رفع {MEDIA_MODES[mode]} ({file_path.stat().st_size / 1_000_000:.1f}MB)...")
                 try:
                     await context.bot.send_chat_action(
@@ -662,9 +1012,16 @@ async def process_media(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
                         await message.reply_audio(audio=media_file, caption="✅ تفضل الصوت بصيغة MP3",
                                                   **UPLOAD_TIMEOUTS)
                     else:
-                        await message.reply_video(video=media_file, caption="✅ تفضل فيديوك",
+                        caption = "✅ تفضل فيديوك" if video_has_audio else (
+                            "⚠️ هذا الفيديو بلا مسار صوت في النسخ المتاحة من المصدر؛ "
+                            "تعذّر استرجاع الصوت."
+                        )
+                        await message.reply_video(video=media_file, caption=caption,
                                                   supports_streaming=True, **UPLOAD_TIMEOUTS)
-        logger.info("Media sent successfully: mode=%s", mode)
+        if mode == "video":
+            logger.info("Media sent successfully: mode=video has_audio=%s", video_has_audio)
+        else:
+            logger.info("Media sent successfully: mode=%s", mode)
         try:
             await status.delete()
         except Exception:
@@ -802,6 +1159,7 @@ def main():
     require_media_tools()
     logger.info("Runtime: yt-dlp=%s; curl-cffi=%s; gallery-dl=%s",
                 version("yt-dlp"), version("curl-cffi"), version("gallery-dl"))
+    logger.info("Instagram strategy: complete MP4 first; verify actual audio streams")
     base_url = (os.environ.get("WEBHOOK_URL", "").strip()
                 or os.environ.get("RENDER_EXTERNAL_URL", "").strip())
     port = int(os.environ.get("PORT", "10000"))
@@ -828,4 +1186,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--instagram-photos"]:
+        if len(sys.argv) != 4:
+            raise SystemExit(2)
+        raise SystemExit(instagram_photo_worker_main(sys.argv[2], Path(sys.argv[3])))
     main()

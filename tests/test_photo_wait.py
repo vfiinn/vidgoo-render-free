@@ -33,7 +33,9 @@ class FastPhotoTests(unittest.TestCase):
                 bot.download_photos(POST, Path("."))
         self.assertEqual(run.call_args.kwargs["timeout"], 60)
         command = run.call_args.args[0]
-        self.assertEqual(command[command.index("--retries") + 1], "0")
+        self.assertEqual(command[2], "--instagram-photos")
+        gallery = bot.build_gallery_command("https://x.com/user/status/1", Path("."))
+        self.assertEqual(gallery[gallery.index("--retries") + 1], "0")
 
     def test_empty_instagram_response_does_not_blame_telegram_upload(self):
         text = bot.download_error_message(Exception("Instagram sent an empty media response"))

@@ -118,9 +118,12 @@ class PhotoTests(unittest.TestCase):
 class AudioTests(unittest.TestCase):
     def test_audio_options_and_final_mp3_only(self):
         options = bot.build_ydl_options(Path("."), URL, "audio")
-        self.assertEqual(options["format"], "bestaudio/best")
+        self.assertEqual(
+            options["format"],
+            f"bestaudio/{bot.INSTAGRAM_COMPLETE_FORMAT}/best*[acodec!=none]",
+        )
         self.assertNotIn("merge_output_format", options)
-        self.assertEqual(options["postprocessors"][0]["preferredcodec"], "mp3")
+        self.assertEqual(options["postprocessors"], [])
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             original = root / "track.m4a"

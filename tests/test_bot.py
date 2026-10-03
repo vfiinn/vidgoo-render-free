@@ -88,7 +88,9 @@ class BotTests(unittest.TestCase):
             root = Path(folder)
             path = root / "video.mp4"
             path.write_bytes(b"video")
-            with patch.object(bot.yt_dlp, "YoutubeDL") as factory:
+            with patch.object(bot.yt_dlp, "YoutubeDL") as factory, patch.object(
+                bot, "probe_media", return_value=(12.0, True)
+            ):
                 downloader = factory.return_value.__enter__.return_value
                 downloader.extract_info.return_value = {
                     "_type": "playlist", "entries": [None, {"id": "video"}],
@@ -210,7 +212,9 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             message.reply_video.side_effect = upload
             with patch.object(bot, "DOWNLOAD_DIR", Path(folder)), patch.object(
                 bot, "download_media_async", side_effect=download
-            ), patch.object(bot, "compress_video", side_effect=compress):
+            ), patch.object(bot, "compress_video", side_effect=compress), patch.object(
+                bot, "probe_media", return_value=(12.0, True)
+            ):
                 await bot.process_media(update, context, message.text, "video")
             self.assertEqual(list(Path(folder).iterdir()), [])
             self.assertEqual(sent, [] if failure in ("download", "compress")
