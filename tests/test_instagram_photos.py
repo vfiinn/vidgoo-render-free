@@ -1,4 +1,5 @@
 """Offline regressions for the current Instagram photo worker."""
+import io
 import json
 import subprocess
 import sys
@@ -7,6 +8,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from yt_dlp.extractor.instagram import InstagramIE
 
@@ -147,6 +149,47 @@ class InstagramPhotoTests(unittest.TestCase):
                 with self.assertRaises(bot.DownloadFailure) as raised:
                     bot.download_photos(POST, root)
         self.assertEqual(str(raised.exception), error)
+
+    def test_metadata_failure_logs_original_cause_and_keeps_friendly_json(self):
+        detail = "Unexpected Instagram metadata fixture response"
+        with patch.object(bot, "configure_logging"), patch.object(
+            InstagramIE, "extract",
+            side_effect=bot.yt_dlp.utils.ExtractorError(detail),
+        ), patch("sys.stdout", new_callable=io.StringIO) as output, self.assertLogs(
+            bot.logger, level="WARNING"
+        ) as logs:
+            status = bot.instagram_photo_worker_main(POST, Path("unused"))
+
+        self.assertEqual(status, 1)
+        self.assertIn(detail, "\n".join(logs.output))
+        self.assertEqual(json.loads(output.getvalue()), {
+            "error": bot.download_error_message(Exception(detail)),
+        })
+        self.assertNotIn(detail, output.getvalue())
+
+    def test_image_failure_logs_http_cause_and_keeps_friendly_json(self):
+        image_url = "https://cdninstagram.com/photo.jpg"
+        detail = "Fixture image access denied"
+        failure = HTTPError(image_url, 403, detail, {}, None)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch.object(bot, "configure_logging"), patch.object(
+                bot, "extract_instagram_photo_urls", return_value=[image_url],
+            ), patch.object(
+                bot, "open_instagram_photo", side_effect=failure,
+            ), patch("sys.stdout", new_callable=io.StringIO) as output, self.assertLogs(
+                bot.logger, level="WARNING"
+            ) as logs:
+                status = bot.instagram_photo_worker_main(POST, root)
+            self.assertEqual(list(root.iterdir()), [])
+
+        self.assertEqual(status, 1)
+        self.assertIn(detail, "\n".join(logs.output))
+        self.assertIn("403", "\n".join(logs.output))
+        self.assertEqual(json.loads(output.getvalue()), {
+            "error": bot.download_error_message(failure),
+        })
+        self.assertNotIn(detail, output.getvalue())
 
 
 if __name__ == "__main__":

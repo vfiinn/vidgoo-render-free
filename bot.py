@@ -574,6 +574,7 @@ def instagram_photo_worker_main(url: str, out_dir: Path) -> int:
     try:
         download_instagram_photos(url, out_dir)
     except DownloadFailure as exc:
+        logger.warning("Instagram photo worker failed: %s", exc.__cause__ or exc)
         print(json.dumps({"error": str(exc)}, ensure_ascii=True))
         return 1
     except Exception as exc:
