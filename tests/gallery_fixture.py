@@ -7,6 +7,7 @@ from unittest.mock import patch
 import gallery_dl
 from gallery_dl.extractor.common import Extractor, Message
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bot
 
 
