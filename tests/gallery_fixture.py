@@ -12,7 +12,8 @@ import bot
 
 
 if __name__ == "__main__":
-    destination, local_url = sys.argv[1:]
+    destination, local_url = sys.argv[1:3]
+    mode = sys.argv[3] if len(sys.argv) > 3 else "photos"
     post_url = "https://www.instagram.com/p/fixture/"
 
     class FixtureExtractor(Extractor):
@@ -21,6 +22,12 @@ if __name__ == "__main__":
         request_interval = 0
 
         def items(self):
+            if mode == "metadata-error":
+                self.request(local_url + "/blocked")
+            if mode == "download-error":
+                yield Message.Directory, None, {}
+                yield Message.Url, local_url + "/blocked", {"num": 1, "extension": "png"}
+                return
             yield Message.Directory, None, {}
             # The file filter must not download this movie or count it against the photo range.
             yield Message.Url, local_url + "/movie.mp4", {"num": 0, "extension": "mp4"}
