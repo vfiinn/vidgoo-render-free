@@ -210,6 +210,29 @@ class RealDispatchTests(AioHTTPTestCase):
         self.assertFalse(self.real_application.running)
         self.assertNotIn("deleteWebhook", self.api_calls)
 
+    async def test_removed_photos_command_replies_without_starting_media_job(self):
+        payload = {
+            "update_id": 102,
+            "message": {
+                "message_id": 1, "date": 1700000000,
+                "chat": {"id": 1, "type": "private"},
+                "from": {"id": 1, "is_bot": False, "first_name": "Test"},
+                "text": "/photos https://www.instagram.com/p/example/",
+                "entities": [{"offset": 0, "length": 7, "type": "bot_command"}],
+            },
+        }
+        with patch.object(bot, "process_media", new_callable=AsyncMock) as process:
+            response = await self.client.post(
+                bot.WEBHOOK_PATH, json=payload,
+                headers={"X-Telegram-Bot-Api-Secret-Token": bot.webhook_secret(TOKEN)},
+            )
+            self.assertEqual(response.status, 200)
+            await asyncio.wait_for(self.replied.wait(), timeout=3)
+        self.assertEqual(self.reply_text, bot.IMAGES_UNSUPPORTED_MESSAGE)
+        process.assert_not_awaited()
+        self.assertNotIn("media_jobs", self.real_application.bot_data)
+        self.assertEqual(self.api_calls, ["getMe", "setWebhook", "sendMessage"])
+
     async def test_link_buttons_and_callback_dispatch_through_real_application(self):
         message = {
             "message_id": 1, "date": 1700000000,
@@ -224,6 +247,10 @@ class RealDispatchTests(AioHTTPTestCase):
         self.assertEqual(response.status, 200)
         await asyncio.wait_for(self.replied.wait(), timeout=3)
         keyboard = json.loads(self.api_params["sendMessage"]["reply_markup"][0])["inline_keyboard"]
+        self.assertEqual(len(keyboard), 1)
+        self.assertEqual(len(keyboard[0]), 2)
+        self.assertEqual([button["callback_data"].split(":")[1] for button in keyboard[0]],
+                         ["video", "audio"])
         selected = keyboard[0][1]["callback_data"]
         processed = asyncio.Event()
         calls = []
@@ -249,3 +276,4 @@ class RealDispatchTests(AioHTTPTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

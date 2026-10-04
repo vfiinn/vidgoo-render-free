@@ -36,6 +36,18 @@ class BotTests(unittest.TestCase):
         self.assertNotIn("extractor_args", options)
         self.assertEqual(options["playlist_items"], "1")
 
+    def test_commands_route_audio_video_and_retired_photos_separately(self):
+        application = bot.create_application("123456789:" + "A" * 35, webhook=True)
+        commands = {}
+        for handlers in application.handlers.values():
+            for handler in handlers:
+                if isinstance(handler, bot.CommandHandler):
+                    for command in handler.commands:
+                        commands[command] = handler.callback
+        self.assertIs(commands["video"], bot.media_command)
+        self.assertIs(commands["audio"], bot.media_command)
+        self.assertIs(commands["photos"], bot.unsupported_photos)
+
     def test_redaction_covers_formatted_arguments_and_tracebacks(self):
         token = "123456789:" + "A" * 35
         output = io.StringIO()
@@ -63,10 +75,17 @@ class BotTests(unittest.TestCase):
             ("Unexpected response from webpage request", "رد المنصة"),
             ("Connection timed out", "الاتصال"),
             ("404 Not found", "غير متاح"),
+            ("No video formats found", "غير متاح"),
             ("unknown error", "فشل تنزيل"),
         ]
         for error, expected in cases:
             self.assertIn(expected, bot.download_error_message(Exception(error)))
+
+    def test_empty_instagram_response_does_not_blame_telegram_upload(self):
+        text = bot.download_error_message(Exception("Instagram sent an empty media response"))
+        self.assertIn("لم يُرجع بيانات", text)
+        self.assertIn("قد يكون", text)
+        self.assertIn("بدون كوكيز", text)
 
     def test_final_file_not_partial_or_outside_request(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -239,6 +258,14 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         status = SimpleNamespace(edit_text=AsyncMock(side_effect=RuntimeError("edit failed")))
         await bot.edit_status(status, "working")
 
+    async def test_unchanged_status_no_long_traceback_but_other_api_errors_logged(self):
+        for error, logged in ((bot.BadRequest("Message is not modified"), False),
+                              (bot.BadRequest("Message to edit not found"), True)):
+            status = SimpleNamespace(edit_text=AsyncMock(side_effect=error))
+            with patch.object(bot.logger, "warning") as warning:
+                await bot.edit_status(status, "same content")
+            self.assertEqual(warning.called, logged)
+
     async def test_conflict_is_handled(self):
         with patch.object(bot.logger, "error") as log:
             await bot.on_error(None, SimpleNamespace(error=bot.Conflict("another poll")))
@@ -265,3 +292,4 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

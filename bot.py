@@ -1,4 +1,4 @@
-"""Download public videos, MP3 audio and post photos from X, Instagram and TikTok."""
+"""Download public videos and MP3 audio from X, Instagram and TikTok."""
 import asyncio
 import copy
 import hashlib
@@ -11,11 +11,9 @@ import re
 import secrets
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
-import warnings
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.metadata import version
@@ -24,8 +22,7 @@ from urllib.parse import urlsplit
 
 import yt_dlp
 from aiohttp import web
-from PIL import Image, ImageOps, UnidentifiedImageError
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, Conflict
 from telegram.ext import (
@@ -42,11 +39,8 @@ SUPPORTED_DOMAINS = ("twitter.com", "x.com", "instagram.com", "tiktok.com")
 GENERIC_URL_PATTERN = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 logger = logging.getLogger(__name__)
 WEBHOOK_PATH = "/telegram/webhook"
-MEDIA_MODES = {"video": "الفيديو", "audio": "الصوت", "photos": "الصور"}
-MAX_PHOTOS = 20
-PHOTO_TIMEOUT_SECONDS = 60
-PHOTO_HTTP_TIMEOUT_SECONDS = 12
-PHOTO_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "avif", "gif")
+MEDIA_MODES = {"video": "الفيديو", "audio": "الصوت"}
+IMAGES_UNSUPPORTED_MESSAGE = "تنزيل الصور غير مدعوم. أرسل رابط فيديو واختر فيديو أو صوت MP3."
 CHOICE_TTL_SECONDS = 15 * 60
 UPLOAD_TIMEOUTS = dict(write_timeout=180, read_timeout=180, connect_timeout=30)
 NO_AUDIO_MESSAGE = (
@@ -210,14 +204,6 @@ def find_downloaded_file(info: dict, out_dir: Path, prepared_filename: str,
                           else "لم ينتج التنزيل ملف فيديو مكتملًا.")
 
 
-def is_instagram_reel(url: str) -> bool:
-    parsed = urlsplit(url)
-    host = (parsed.hostname or "").lower()
-    return (host == "instagram.com" or host.endswith(".instagram.com")) and bool(
-        re.fullmatch(r"/(?:reels?|tv)/[A-Za-z0-9_-]+/?", parsed.path)
-    )
-
-
 def canonical_media_url(url: str) -> str:
     parsed = urlsplit(url)
     host = (parsed.hostname or "").lower()
@@ -370,6 +356,8 @@ def extract_mp3(source: Path) -> Path:
 
 
 def download_media(url: str, out_dir: Path, mode: str = "video") -> tuple[Path, str | None]:
+    if mode not in MEDIA_MODES:
+        raise DownloadFailure(IMAGES_UNSUPPORTED_MESSAGE)
     if extract_supported_url(url) != url:
         raise DownloadFailure("الروابط المدعومة: تويتر/X وإنستغرام وتيك توك فقط.")
     url = canonical_media_url(url)
@@ -396,266 +384,6 @@ def download_media(url: str, out_dir: Path, mode: str = "video") -> tuple[Path, 
                 return extract_mp3(path), info.get("id")
             raise DownloadFailure(NO_AUDIO_MESSAGE) from exc
         raise DownloadFailure(download_error_message(exc)) from exc
-
-
-def photo_post_url(url: str) -> str:
-    """Accept single posts only, never crawl an entire profile or search page."""
-    if extract_supported_url(url) != url:
-        raise DownloadFailure("الروابط المدعومة: تويتر/X وإنستغرام وتيك توك فقط.")
-    parsed = urlsplit(url)
-    host, path = (parsed.hostname or "").lower(), parsed.path
-    if host in ("instagram.com", "www.instagram.com"):
-        if re.fullmatch(r"/(?:reels?|tv)/[A-Za-z0-9_-]+/?", path):
-            raise DownloadFailure(
-                "هذا رابط ريل/فيديو، وليس منشور صور. اختر 🎬 فيديو أو 🎵 صوت MP3."
-            )
-        match = re.fullmatch(r"/(p)/([A-Za-z0-9_-]+)/?", path)
-        if match:
-            return f"https://www.instagram.com/{match[1]}/{match[2]}/"
-    elif host in ("x.com", "www.x.com", "mobile.x.com", "twitter.com",
-                  "www.twitter.com", "mobile.twitter.com"):
-        match = re.fullmatch(r"/([A-Za-z0-9_]+|i/web)/status/(\d+)(?:/(?:photo|video)/\d+)?/?", path)
-        if match:
-            return f"https://x.com/{match[1]}/status/{match[2]}"
-    elif host in ("tiktok.com", "www.tiktok.com", "m.tiktok.com"):
-        if re.fullmatch(r"/(?:@[\w.-]+|share)/(?:photo|video)/\d+/?", path):
-            return f"https://www.tiktok.com{path}"
-        if re.fullmatch(r"/t/[A-Za-z0-9]+/?", path):
-            return f"https://www.tiktok.com{path}"
-    elif host in ("vm.tiktok.com", "vt.tiktok.com"):
-        if re.fullmatch(r"/[A-Za-z0-9]+/?", path):
-            return f"https://{host}{path}"
-    raise DownloadFailure("لتحميل الصور أرسل رابط المنشور نفسه، وليس رابط الحساب أو البحث.")
-
-
-def build_gallery_command(url: str, out_dir: Path) -> list[str]:
-    return [
-        sys.executable, "-m", "gallery_dl", "--config-ignore", "--no-input",
-        "--no-colors", "--no-postprocessors", "--warning", "--cache-file", ":memory:",
-        "--directory", str(out_dir.resolve()), "--filename", "{num:03}.{extension}",
-        # Never sleep for minutes retrying blocked requests while holding the media queue.
-        "--range", f"1-{MAX_PHOTOS}", "--post-range", "1", "--retries", "0",
-        "--http-timeout", str(PHOTO_HTTP_TIMEOUT_SECONDS), "--filesize-max", "49M",
-        "--filter", f"extension.lower() in {PHOTO_EXTENSIONS!r}",
-        "--whitelist", "instagram:post,twitter:tweet,tiktok:post",
-        "-o", "extractor.cookies=null", "-o", "extractor.cookies-update=false",
-        "-o", "extractor.sleep-429=0", "-o", "downloader.http.sleep-429=0",
-        "-o", "extractor.netrc=false", "-o", "extractor.videos=false",
-        "-o", "extractor.audio=false", "-o", "extractor.previews=false",
-        "-o", "extractor.instagram.static-videos=false",
-        "-o", "extractor.twitter.conversations=false", "-o", "extractor.twitter.quoted=false",
-        "-o", "extractor.tiktok.covers=false", url,
-    ]
-
-
-def is_instagram_image_url(url: str) -> bool:
-    """Only accept HTTPS image links returned by Instagram's own CDN."""
-    try:
-        parsed = urlsplit(url)
-        host = (parsed.hostname or "").lower()
-        return (parsed.scheme == "https" and not parsed.username and not parsed.password
-                and parsed.port in (None, 443)
-                and any(host == domain or host.endswith("." + domain)
-                        for domain in ("cdninstagram.com", "fbcdn.net")))
-    except (ValueError, TypeError):
-        return False
-
-
-def select_instagram_photo_urls(product: dict) -> list[str]:
-    """Select real photo items, never video thumbnails, in carousel order."""
-    if isinstance(product, list):
-        product = product[0] if product else None
-    if not isinstance(product, dict):
-        raise DownloadFailure("إنستغرام لم يُرجع بيانات صور صالحة لهذا المنشور.")
-    items = product.get("carousel_media") if product.get("media_type") == 8 else [product]
-    urls = []
-    for item in items or []:
-        if (not isinstance(item, dict) or item.get("media_type") != 1
-                or item.get("video_versions") or item.get("video_dash_manifest")):
-            continue
-        candidates = (item.get("image_versions2") or {}).get("candidates") or []
-        candidates = [c for c in candidates if isinstance(c, dict)
-                      and isinstance(c.get("url"), str) and is_instagram_image_url(c["url"])]
-        if not candidates:
-            raise DownloadFailure("تعذّر الحصول على رابط صورة صالح من إنستغرام.")
-        # Some logged-out responses omit dimensions; retain their first candidate.
-        best = max(candidates, key=lambda c: (c.get("width") or 0) * (c.get("height") or 0))
-        urls.append(best["url"])
-        if len(urls) == MAX_PHOTOS:
-            break
-    if not urls:
-        raise DownloadFailure("لا توجد صور قابلة للتنزيل في هذا المنشور؛ أغلفة الفيديو ليست صور منشور.")
-    return urls
-
-
-def extract_instagram_photo_urls(url: str) -> list[str]:
-    # Use the pinned extractor's ungated/logged-out post response. This local
-    # subclass intercepts photo metadata without changing the video/audio extractor.
-    from yt_dlp.extractor.instagram import InstagramIE
-
-    class PhotoMetadata(Exception):
-        def __init__(self, product):
-            self.product = product
-
-    class PhotoExtractor(InstagramIE):
-        def _extract_product(self, product_info, *args, **kwargs):
-            raise PhotoMetadata(product_info)
-
-    options = {
-        "quiet": True, "skip_download": True, "logger": YTDLPLogger(),
-        "socket_timeout": PHOTO_HTTP_TIMEOUT_SECONDS, "retries": 0,
-        "extractor_retries": 0, "cookiefile": None, "cookiesfrombrowser": None,
-        "usenetrc": False,
-    }
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            PhotoExtractor(ydl).extract(url)
-    except PhotoMetadata as metadata:
-        return select_instagram_photo_urls(metadata.product)
-    except yt_dlp.utils.ExtractorError as exc:
-        raise DownloadFailure(download_error_message(exc)) from exc
-    raise DownloadFailure("إنستغرام لم يُرجع صور هذا المنشور.")
-
-
-def open_instagram_photo(url: str):
-    from urllib.request import HTTPRedirectHandler, Request, build_opener
-
-    class NoRedirect(HTTPRedirectHandler):
-        def redirect_request(self, request, fp, code, msg, headers, newurl):
-            return None
-
-    if not is_instagram_image_url(url):
-        raise DownloadFailure("رابط الصورة ليس من خادم صور إنستغرام المسموح.")
-    # No account cookies, automatic retries, or redirects to arbitrary hosts.
-    return build_opener(NoRedirect()).open(
-        Request(url, headers={"Referer": "https://www.instagram.com/"}),
-        timeout=PHOTO_HTTP_TIMEOUT_SECONDS,
-    )
-
-
-def download_instagram_photos(url: str, out_dir: Path):
-    url = photo_post_url(url)
-    if (urlsplit(url).hostname or "").lower() not in ("instagram.com", "www.instagram.com"):
-        raise DownloadFailure("أداة صور إنستغرام تقبل منشور إنستغرام فقط.")
-    urls = extract_instagram_photo_urls(url)
-    extensions = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp", "AVIF": "avif", "GIF": "gif"}
-    for number, image_url in enumerate(urls, 1):
-        partial = out_dir / f"{number:03}.image.part"
-        try:
-            with open_instagram_photo(image_url) as response, partial.open("wb") as output:
-                declared = response.headers.get("Content-Length", "")
-                if declared.isdecimal() and int(declared) >= MAX_FILE_SIZE_BYTES:
-                    raise DownloadFailure("حجم الصورة يتجاوز الحد المسموح لإرسالها.")
-                size = 0
-                while chunk := response.read(64 * 1024):
-                    size += len(chunk)
-                    if size >= MAX_FILE_SIZE_BYTES:
-                        raise DownloadFailure("حجم الصورة يتجاوز الحد المسموح لإرسالها.")
-                    output.write(chunk)
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(partial) as image:
-                    extension = extensions.get(image.format)
-                    if not extension:
-                        raise DownloadFailure("صيغة الصورة غير مدعومة.")
-                    image.verify()
-            partial.replace(out_dir / f"{number:03}.{extension}")
-        except DownloadFailure:
-            raise
-        except (OSError, ValueError, Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
-            raise DownloadFailure(download_error_message(exc)) from exc
-        finally:
-            partial.unlink(missing_ok=True)
-    logger.info("Instagram photos downloaded successfully: count=%s", len(urls))
-
-
-def instagram_photo_worker_main(url: str, out_dir: Path) -> int:
-    configure_logging()
-    try:
-        download_instagram_photos(url, out_dir)
-    except DownloadFailure as exc:
-        logger.warning("Instagram photo worker failed: %s", exc.__cause__ or exc)
-        print(json.dumps({"error": str(exc)}, ensure_ascii=True))
-        return 1
-    except Exception as exc:
-        logger.warning("Instagram photo worker failed: %s", type(exc).__name__)
-        print(json.dumps({"error": "تعذّر تنزيل صور المنشور. جرّب لاحقًا."}, ensure_ascii=True))
-        return 1
-    return 0
-
-
-def download_photos(url: str, out_dir: Path) -> list[Path]:
-    url = photo_post_url(url)
-    instagram = (urlsplit(url).hostname or "").lower() in ("instagram.com", "www.instagram.com")
-    command = ([sys.executable, str(Path(__file__).resolve()), "--instagram-photos",
-                url, str(out_dir.resolve())] if instagram else build_gallery_command(url, out_dir))
-    try:
-        result = subprocess.run(
-            command, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=PHOTO_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
-            env={key: value for key, value in os.environ.items() if key != "BOT_TOKEN"},
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise DownloadFailure(
-            "تجاوز تنزيل الصور مهلة دقيقة، فتم إيقافه حتى لا تتعطل الطلبات التالية. حاول لاحقًا."
-        ) from exc
-    except OSError as exc:
-        raise DownloadFailure("تعذّر تشغيل أداة تحميل الصور على الخادم.") from exc
-    if result.returncode:
-        logger.warning("Photo download failed: %s", result.stderr[-2000:])
-        if instagram:
-            try:
-                error = json.loads(getattr(result, "stdout", ""))["error"]
-                if isinstance(error, str) and error and len(error) < 600:
-                    raise DownloadFailure(error)
-            except (ValueError, KeyError, TypeError):
-                pass
-        raise DownloadFailure(download_error_message(Exception(result.stderr)))
-    photos = []
-    for path in sorted(out_dir.iterdir()):
-        if path.suffix.lower().lstrip(".") not in PHOTO_EXTENSIONS:
-            continue
-        if (path.is_symlink() or path.resolve().parent != out_dir.resolve()
-                or not path.is_file() or not 0 < path.stat().st_size < MAX_FILE_SIZE_BYTES):
-            raise DownloadFailure("لم ينتج التنزيل صورًا مكتملة بحجم مناسب.")
-        photos.append(path)
-    if not photos:
-        raise DownloadFailure("لا توجد صور قابلة للتنزيل في هذا المنشور، أو أنها غير متاحة أو كبيرة جدًا.")
-    if len(photos) > MAX_PHOTOS:
-        raise DownloadFailure("تجاوز التنزيل الحد المسموح للصور.")
-    return photos
-
-
-def prepare_photo(source: Path) -> tuple[Path, bool]:
-    """Normalize a preview for sendPhoto; preserve panoramas/large images as documents."""
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(source) as image:
-                width, height = image.size
-                if width * height > 25_000_000 or max(width, height) > 20 * min(width, height):
-                    image.verify()
-                    return source, True
-                image.draft("RGB", (3000, 3000))
-                image = ImageOps.exif_transpose(image)
-                image.thumbnail((3000, 3000))
-                rgb = Image.new("RGB", image.size, "white")
-                if "A" in image.getbands():
-                    rgba = image.convert("RGBA")
-                    rgb.paste(rgba, mask=rgba.getchannel("A"))
-                else:
-                    rgb.paste(image.convert("RGB"))
-                output_dir = source.parent / "prepared"
-                output_dir.mkdir(exist_ok=True)
-                output = output_dir / (source.stem + ".jpg")
-                for quality in (90, 75, 60):
-                    rgb.save(output, "JPEG", quality=quality)
-                    if 0 < output.stat().st_size < 9_500_000:
-                        return output, False
-                return source, True
-    except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError,
-            Image.DecompressionBombWarning) as exc:
-        raise DownloadFailure("تعذّر قراءة إحدى الصور؛ لم يتم إرسال ملف غير صالح.") from exc
 
 
 class CompressionError(RuntimeError):
@@ -815,7 +543,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(
             "أهلًا! ابعت رابط منشور من تويتر/X أو إنستغرام أو تيك توك 👋\n"
-            "ثم اختر: 🎬 فيديو، 🎵 صوت MP3، أو 🖼 صور.\n"
+            "ثم اختر: 🎬 فيديو أو 🎵 صوت MP3.\n"
             "أضغط الفيديو أو الصوت الكبير تلقائيًا تحت 50MB."
         )
 
@@ -825,8 +553,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "أرسل رابط منشور من تويتر/X أو إنستغرام أو تيك توك واختر نوع التحميل.\n"
             "🎵 الصوت: استخراج MP3 من رابط الفيديو، وليس رابط اسم أغنية.\n"
-            "🖼 الصور: صور المنشور الأصلي، حتى 20 صورة؛ ليست لقطات من الفيديو.\n"
-            "الأوامر المباشرة: /video أو /audio أو /photos ثم الرابط.\n"
+            "الأوامر المباشرة: /video أو /audio ثم الرابط.\n"
+            "تنزيل الصور غير مدعوم.\n"
             "التحميل بدون كوكيز حساب؛ المحتوى الذي تطلب المنصة تسجيل دخول له غير مدعوم.\n"
             "إذا احتوى المنشور عدة فيديوهات، يُحمّل أول فيديو فقط.\n"
             "الخيارات صالحة 15 دقيقة وتُلغى عند إعادة تشغيل البوت؛ أعد إرسال الرابط عند الحاجة.\n"
@@ -870,11 +598,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("🎬 فيديو", callback_data=f"media:video:{request_id}"),
         InlineKeyboardButton("🎵 صوت MP3", callback_data=f"media:audio:{request_id}"),
     ]
-    if not is_instagram_reel(url):
-        buttons.append(InlineKeyboardButton("🖼 صور", callback_data=f"media:photos:{request_id}"))
     keyboard = InlineKeyboardMarkup([buttons])
-    prompt = ("هذا رابط ريل/فيديو؛ اختر الفيديو أو الصوت. الصور تحتاج رابط منشور صور."
-              if is_instagram_reel(url) else "شو بدك تحمّل من هذا الرابط؟")
+    prompt = "شو بدك تحمّل من هذا الرابط؟ اختر فيديو أو صوت MP3."
     try:
         await update.message.reply_text(prompt, reply_markup=keyboard)
     except Exception:
@@ -886,7 +611,10 @@ async def media_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query or not isinstance(query.data, str):
         return
-    match = re.fullmatch(r"media:(video|audio|photos):([0-9a-f]{12})", query.data)
+    if query.data.startswith("media:photos:"):
+        await query.answer(IMAGES_UNSUPPORTED_MESSAGE, show_alert=True)
+        return
+    match = re.fullmatch(r"media:(video|audio):([0-9a-f]{12})", query.data)
     choices = context.user_data.get("media_choices", {})
     item = choices.get(match[2]) if match else None
     if (not item or not update.effective_chat or not update.effective_user
@@ -915,53 +643,23 @@ async def media_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = (update.message.text or "").split()[0].split("@")[0].lstrip("/").lower()
     url = extract_supported_url(" ".join(context.args or []))
     if mode not in MEDIA_MODES or not url:
-        await update.message.reply_text("اكتب /video أو /audio أو /photos ثم رابط المنشور المدعوم.")
+        await update.message.reply_text("اكتب /video أو /audio ثم رابط المنشور المدعوم.")
         return
     await process_media(update, context, url, mode)
 
 
-async def send_photos(message, paths: list[Path]):
-    # Prepare every image before any upload, so corrupt downloads are not a partial success.
-    prepared = [await run_media_worker(prepare_photo, path) for path in paths]
-    album = []
-
-    async def flush():
-        if len(album) == 1:
-            with album[0].open("rb") as photo:
-                await message.reply_photo(photo=photo, caption="✅ تفضل صورتك", **UPLOAD_TIMEOUTS)
-        elif album:
-            await message.reply_media_group(
-                media=[InputMediaPhoto(path, caption="✅ تفضل صور المنشور" if i == 0 else None)
-                       for i, path in enumerate(album)], **UPLOAD_TIMEOUTS,
-            )
-        album.clear()
-
-    for path, as_document in prepared:
-        if as_document:
-            await flush()
-            with path.open("rb") as document:
-                await message.reply_document(
-                    document=document, caption="🖼 الصورة الأصلية كملف بسبب أبعادها أو حجمها",
-                    **UPLOAD_TIMEOUTS,
-                )
-        else:
-            album.append(path)
-            if len(album) == 10:
-                await flush()
-    await flush()
+async def unsupported_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_message:
+        await update.effective_message.reply_text(IMAGES_UNSUPPORTED_MESSAGE)
 
 
 async def process_media(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, mode: str):
     message = update.effective_message
-    if not message or mode not in MEDIA_MODES:
+    if not message:
         return
-    if mode == "photos":
-        # Reject reel/profile requests BEFORE queue admission, even if another job is busy.
-        try:
-            url = photo_post_url(url)
-        except DownloadFailure as exc:
-            await message.reply_text(f"❌ {exc}")
-            return
+    if mode not in MEDIA_MODES:
+        await message.reply_text(IMAGES_UNSUPPORTED_MESSAGE)
+        return
     state = context.bot_data
     # One expensive media worker on the Free instance, with at most three waiting requests.
     if state.get("media_jobs", 0) >= 4:
@@ -979,46 +677,41 @@ async def process_media(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
         async with semaphore:
             await edit_status(status, f"⏳ جاري تنزيل {MEDIA_MODES[mode]}...")
             request_dir = Path(tempfile.mkdtemp(prefix="request-", dir=DOWNLOAD_DIR))
-            if mode == "photos":
-                paths = await run_media_worker(download_photos, url, request_dir)
-                await edit_status(status, f"📤 جاري تجهيز وإرسال {len(paths)} صورة (حتى {MAX_PHOTOS})...")
-                await send_photos(message, paths)
+            if mode == "audio":
+                file_path, _ = await run_media_worker(download_media, url, request_dir, "audio")
+                # A renamed/invalid file must not be sent as a playable audio track.
+                await run_media_worker(lambda path: probe_media(path, audio_only=True), file_path)
             else:
+                file_path, _ = await download_media_async(url, request_dir)
+            if file_path.stat().st_size >= MAX_FILE_SIZE_BYTES:
+                await edit_status(status, f"🗜️ جاري ضغط {MEDIA_MODES[mode]} تحت 50MB؛ قد يستغرق دقائق...")
+                file_path = await run_media_worker(
+                    compress_audio if mode == "audio" else compress_video, file_path,
+                )
+            if not 0 < file_path.stat().st_size < MAX_FILE_SIZE_BYTES:
+                raise CompressionError("حجم الملف غير مناسب للرفع؛ لم يتم إرساله.")
+            video_has_audio = True
+            if mode == "video":
+                _, video_has_audio = await run_media_worker(probe_media, file_path)
+            await edit_status(status, f"📤 جاري رفع {MEDIA_MODES[mode]} ({file_path.stat().st_size / 1_000_000:.1f}MB)...")
+            try:
+                await context.bot.send_chat_action(
+                    chat_id=update.effective_chat.id,
+                    action=ChatAction.UPLOAD_VOICE if mode == "audio" else ChatAction.UPLOAD_VIDEO,
+                )
+            except Exception:
+                logger.warning("Could not send chat action")
+            with file_path.open("rb") as media_file:
                 if mode == "audio":
-                    file_path, _ = await run_media_worker(download_media, url, request_dir, "audio")
-                    # A renamed/invalid file must not be sent as a playable audio track.
-                    await run_media_worker(lambda path: probe_media(path, audio_only=True), file_path)
+                    await message.reply_audio(audio=media_file, caption="✅ تفضل الصوت بصيغة MP3",
+                                              **UPLOAD_TIMEOUTS)
                 else:
-                    file_path, _ = await download_media_async(url, request_dir)
-                if file_path.stat().st_size >= MAX_FILE_SIZE_BYTES:
-                    await edit_status(status, f"🗜️ جاري ضغط {MEDIA_MODES[mode]} تحت 50MB؛ قد يستغرق دقائق...")
-                    file_path = await run_media_worker(
-                        compress_audio if mode == "audio" else compress_video, file_path,
+                    caption = "✅ تفضل فيديوك" if video_has_audio else (
+                        "⚠️ هذا الفيديو بلا مسار صوت في النسخ المتاحة من المصدر؛ "
+                        "تعذّر استرجاع الصوت."
                     )
-                if not 0 < file_path.stat().st_size < MAX_FILE_SIZE_BYTES:
-                    raise CompressionError("حجم الملف غير مناسب للرفع؛ لم يتم إرساله.")
-                video_has_audio = True
-                if mode == "video":
-                    _, video_has_audio = await run_media_worker(probe_media, file_path)
-                await edit_status(status, f"📤 جاري رفع {MEDIA_MODES[mode]} ({file_path.stat().st_size / 1_000_000:.1f}MB)...")
-                try:
-                    await context.bot.send_chat_action(
-                        chat_id=update.effective_chat.id,
-                        action=ChatAction.UPLOAD_VOICE if mode == "audio" else ChatAction.UPLOAD_VIDEO,
-                    )
-                except Exception:
-                    logger.warning("Could not send chat action")
-                with file_path.open("rb") as media_file:
-                    if mode == "audio":
-                        await message.reply_audio(audio=media_file, caption="✅ تفضل الصوت بصيغة MP3",
-                                                  **UPLOAD_TIMEOUTS)
-                    else:
-                        caption = "✅ تفضل فيديوك" if video_has_audio else (
-                            "⚠️ هذا الفيديو بلا مسار صوت في النسخ المتاحة من المصدر؛ "
-                            "تعذّر استرجاع الصوت."
-                        )
-                        await message.reply_video(video=media_file, caption=caption,
-                                                  supports_streaming=True, **UPLOAD_TIMEOUTS)
+                    await message.reply_video(video=media_file, caption=caption,
+                                              supports_streaming=True, **UPLOAD_TIMEOUTS)
         if mode == "video":
             logger.info("Media sent successfully: mode=video has_audio=%s", video_has_audio)
         else:
@@ -1031,10 +724,7 @@ async def process_media(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
         await edit_status(status, f"❌ {exc}")
     except Exception:
         logger.exception("Download/upload request failed")
-        text = "❌ تعذّر تجهيز الملفات أو إرسالها بالكامل. حاول لاحقًا."
-        if mode == "photos":
-            text += " قد تكون بعض الصور وصلت بالفعل."
-        await edit_status(status, text)
+        await edit_status(status, "❌ تعذّر تجهيز الملف أو إرساله بالكامل. حاول لاحقًا.")
     finally:
         state["media_jobs"] -= 1
         if request_dir:
@@ -1146,7 +836,8 @@ def create_application(token: str, *, webhook: bool):
     application = builder.build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler(["video", "audio", "photos"], media_command, block=False))
+    application.add_handler(CommandHandler(["video", "audio"], media_command, block=False))
+    application.add_handler(CommandHandler("photos", unsupported_photos, block=False))
     application.add_handler(CallbackQueryHandler(media_choice, pattern=r"^media:", block=False))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     application.add_error_handler(on_error)
@@ -1158,8 +849,8 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN غير موجود.")
     require_media_tools()
-    logger.info("Runtime: yt-dlp=%s; curl-cffi=%s; gallery-dl=%s",
-                version("yt-dlp"), version("curl-cffi"), version("gallery-dl"))
+    logger.info("Runtime: yt-dlp=%s; curl-cffi=%s",
+                version("yt-dlp"), version("curl-cffi"))
     logger.info("Instagram strategy: complete MP4 first; verify actual audio streams")
     base_url = (os.environ.get("WEBHOOK_URL", "").strip()
                 or os.environ.get("RENDER_EXTERNAL_URL", "").strip())
@@ -1187,8 +878,5 @@ def main():
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["--instagram-photos"]:
-        if len(sys.argv) != 4:
-            raise SystemExit(2)
-        raise SystemExit(instagram_photo_worker_main(sys.argv[2], Path(sys.argv[3])))
     main()
+
