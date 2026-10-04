@@ -128,8 +128,6 @@ def build_ydl_options(out_dir: Path, url: str = "", mode: str = "video") -> dict
         "logger": YTDLPLogger(),
         "quiet": True,
         "no_warnings": False,
-        "sleep_interval": 10,
-        "max_sleep_interval": 30,
     }
     if mode == "audio":
         # Prefer audio; unknown codecs are checked against the downloaded file.
