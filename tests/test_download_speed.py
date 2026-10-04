@@ -125,8 +125,13 @@ class FragmentDownloadTests(unittest.TestCase):
                     self.assertIs(downloader_type, DashSegmentsFD)
                     downloader = downloader_type(ydl, ydl.params)
                     if expect_failure:
-                        with self.assertRaises(bot.yt_dlp.utils.DownloadError):
+                        # A parallel worker can close the shared destination while
+                        # another fragment is appended, before DownloadError reaches
+                        # this thread. Both outcomes must abort without publishing.
+                        with self.assertRaises((bot.yt_dlp.utils.DownloadError, ValueError)) as failure:
                             downloader.download(str(output), info)
+                        if isinstance(failure.exception, ValueError):
+                            self.assertEqual(str(failure.exception), "write to closed file")
                         self.assertFalse(output.exists(), "Incomplete final file was published")
                     else:
                         success, _ = downloader.download(str(output), info)
@@ -172,3 +177,4 @@ class FragmentDownloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
