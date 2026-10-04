@@ -109,10 +109,7 @@ def build_ydl_options(out_dir: Path, url: str = "", mode: str = "video") -> dict
         "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
         "noplaylist": True,
         "playlist_items": "1",
-        
-        # تم تفعيل الكوكيز هنا
-        "cookiefile": "cookies.txt", 
-        
+        "cookiefile": None,
         "cookiesfrombrowser": None,
         "usenetrc": False,
         "retries": 3,
