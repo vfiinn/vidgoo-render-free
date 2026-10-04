@@ -20,6 +20,8 @@ class FragmentDownloadTests(unittest.TestCase):
         all_finished = threading.Event()
         active = peak_active = 0
         started = set()
+        first_wave = set(range(workers))
+        later_in_first_wave = first_wave - {0}
         finished = []
         requests = [0] * len(payloads)
         server_errors = []
@@ -37,7 +39,7 @@ class FragmentDownloadTests(unittest.TestCase):
                     fail_request = index == fail_fragment and (
                         fail_count is None or requests[index] <= fail_count
                     )
-                    if set(range(4)).issubset(started):
+                    if first_wave.issubset(started):
                         first_wave_started.set()
                 try:
                     if fail_request:
@@ -51,12 +53,12 @@ class FragmentDownloadTests(unittest.TestCase):
                             active -= 1
                             counted = False
                         return
-                    # Hold the first four responses until their requests overlap,
-                    # then make the first fragment finish after the next three.
+                    # Hold the first wave until all worker requests overlap,
+                    # then finish the first fragment after the other workers.
                     # Events enforce this ordering without timing-based assertions.
-                    if workers == 4 and fail_fragment is None and index < 4:
+                    if workers > 1 and fail_fragment is None and index < workers:
                         if not first_wave_started.wait(5):
-                            raise TimeoutError("Four fragment requests did not overlap")
+                            raise TimeoutError("Fragment worker requests did not overlap")
                         if index == 0 and not later_fragments_finished.wait(5):
                             raise TimeoutError("Later fragments did not finish first")
                     self.send_response(200)
@@ -70,7 +72,7 @@ class FragmentDownloadTests(unittest.TestCase):
                         finished.append(index)
                         active -= 1
                         counted = False
-                        if {1, 2, 3}.issubset(finished):
+                        if later_in_first_wave.issubset(finished):
                             later_fragments_finished.set()
                         if len(finished) == len(payloads):
                             all_finished.set()
@@ -86,7 +88,10 @@ class FragmentDownloadTests(unittest.TestCase):
             def log_message(self, *args):
                 pass
 
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        class FragmentHTTPServer(ThreadingHTTPServer):
+            request_queue_size = 8
+
+        server = FragmentHTTPServer(("127.0.0.1", 0), Handler)
         server.daemon_threads = True
         thread = threading.Thread(
             target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
@@ -99,7 +104,7 @@ class FragmentDownloadTests(unittest.TestCase):
                 if workers == 1:
                     options["concurrent_fragment_downloads"] = 1
                 else:
-                    self.assertEqual(options.get("concurrent_fragment_downloads"), 4)
+                    self.assertEqual(options.get("concurrent_fragment_downloads"), 8)
                 options.update({
                     "cachedir": False,
                     "proxy": "",
@@ -156,20 +161,20 @@ class FragmentDownloadTests(unittest.TestCase):
         self.assertEqual(serial_peak, 1)
         self.assertEqual(serial_order, list(range(8)))
 
-        parallel_peak, parallel_order, _ = self.download_fragments(workers=4)
-        self.assertEqual(parallel_peak, 4)
+        parallel_peak, parallel_order, _ = self.download_fragments(workers=8)
+        self.assertEqual(parallel_peak, 8)
         self.assertTrue(all(parallel_order.index(index) < parallel_order.index(0)
-                            for index in (1, 2, 3)))
+                            for index in range(1, 8)))
 
     def test_transient_nonfirst_fragment_retries_without_data_loss(self):
         _, _, requests = self.download_fragments(
-            workers=4, fail_fragment=1, fail_count=1
+            workers=8, fail_fragment=1, fail_count=1
         )
         self.assertEqual(requests, [1, 2, 1, 1, 1, 1, 1, 1])
 
     def test_permanent_nonfirst_fragment_failure_rejects_incomplete_file(self):
         _, finished, requests = self.download_fragments(
-            workers=4, fail_fragment=1, fail_count=None, expect_failure=True
+            workers=8, fail_fragment=1, fail_count=None, expect_failure=True
         )
         self.assertEqual(requests[1], 4)
         self.assertNotIn(1, finished)

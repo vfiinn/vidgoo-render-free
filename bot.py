@@ -117,7 +117,7 @@ def build_ydl_options(out_dir: Path, url: str = "", mode: str = "video") -> dict
         # Never report success after silently omitting an unavailable fragment.
         "skip_unavailable_fragments": False,
         # Fetch HLS/DASH fragments in parallel without changing video quality.
-        "concurrent_fragment_downloads": 4,
+        "concurrent_fragment_downloads": 8,
         "extractor_retries": 2,
         "socket_timeout": 30,
         "merge_output_format": "mp4",
@@ -670,12 +670,14 @@ async def process_media(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
     status = None
     request_dir = None
     try:
+        waiting = semaphore.locked()
         status = await message.reply_text(
-            "⏳ طلبك بانتظار انتهاء التحميل السابق..." if semaphore.locked()
+            "⏳ طلبك بانتظار انتهاء التحميل السابق..." if waiting
             else f"⏳ جاري تنزيل {MEDIA_MODES[mode]}..."
         )
         async with semaphore:
-            await edit_status(status, f"⏳ جاري تنزيل {MEDIA_MODES[mode]}...")
+            if waiting:
+                await edit_status(status, f"⏳ جاري تنزيل {MEDIA_MODES[mode]}...")
             request_dir = Path(tempfile.mkdtemp(prefix="request-", dir=DOWNLOAD_DIR))
             if mode == "audio":
                 file_path, _ = await run_media_worker(download_media, url, request_dir, "audio")
